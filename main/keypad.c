@@ -35,8 +35,8 @@ static const char *TAG = "keypad";
 // ---- Pin map (edit to match your board wiring) ----
 // static const gpio_num_t ROWS[] = { GPIO_NUM_15, GPIO_NUM_16, GPIO_NUM_18 };
 // static const gpio_num_t COLS[] = { GPIO_NUM_4, GPIO_NUM_6, GPIO_NUM_7 };
-static const gpio_num_t ROWS[] = { GPIO_NUM_15, GPIO_NUM_16, GPIO_NUM_17 };
-static const gpio_num_t COLS[] = { GPIO_NUM_4, GPIO_NUM_6, GPIO_NUM_7 };
+static const gpio_num_t ROWS[] = { GPIO_NUM_12, GPIO_NUM_15, GPIO_NUM_16, GPIO_NUM_17 };
+static const gpio_num_t COLS[] = { GPIO_NUM_4, GPIO_NUM_6, GPIO_NUM_7, GPIO_NUM_10, GPIO_NUM_11 };
 #define NR_ROWS (sizeof(ROWS) / sizeof(ROWS[0]))
 #define NR_COLS (sizeof(COLS) / sizeof(COLS[0]))
 
@@ -65,33 +65,33 @@ static inline uint32_t now_ms(void) {
 
 static ui_event_type_t map_key_to_ui_event(uint16_t code)
 {
-    // TODO: change these to match your keypad matrix positions
-    // Example (3x3):
-    // row0 col0 = UP
-    // row1 col0 = LEFT
-    // row1 col1 = OK
-    // row1 col2 = RIGHT
-    // row2 col1 = DOWN
-    // row2 col0 = BACK
 
-    //     KEYPAD_NUM_1 = 0x0000,
-//     KEYPAD_NUM_2 = 0x0001,
-//     KEYPAD_NUM_3 = 0x0002,
-//     KEYPAD_NUM_4 = 0x0200,
-//     KEYPAD_NUM_5 = 0x0201,
-//     KEYPAD_NUM_6 = 0x0202,
-//     KEYPAD_UP = 0x0001,
-//     KEYPAD_DOWM = 0x0201,
-//     KEYPAD_ENTER = 0x0202,
-//     KEYPAD_BACK = 0x0200,
+//  KEYPAD_POWER    0x0003,
+//  KEYPAD_UP       0x0000,
+//  KEYPAD_DOWM     0x0104,
+//  KEYPAD_LEFT     0x0001,
+//  KEYPAD_RIGHT    0x0002,
+//  KEYPAD_OK       0x0004,
+//  KEYPAD_BACK     0x0101,
+//  KEYPAD_HOME     0x0102,
+//  KEYPAD_NUM_1    0x0100,
+//  KEYPAD_NUM_2    0x0103,
+//  KEYPAD_NUM_3    0x0202,
+//  KEYPAD_NUM_4    0x0200,
+//  KEYPAD_NUM_5    0x0204,
+//  KEYPAD_NUM_6    0x0203,
+//  KEYPAD_NUM_7    0x0201,
+//  KEYPAD_NUM_8    0x0300,
+//  KEYPAD_NUM_9    0x0303,
+//  KEYPAD_NUM_0    0x0301,
 
     switch (code) {
-        case 0x0001: return UI_EV_UP;     // row0 col0
-        case 0x0000: return UI_EV_LEFT;   // row1 col0
-        case 0x0202: return UI_EV_OK;     // row1 col1
-        case 0x0002: return UI_EV_RIGHT;  // row1 col2
-        case 0x0201: return UI_EV_DOWN;   // row2 col1
-        case 0x0200: return UI_EV_BACK;   // row2 col0
+        case 0x0000: return UI_EV_UP;
+        case 0x0001: return UI_EV_LEFT;
+        case 0x0004: return UI_EV_OK;
+        case 0x0002: return UI_EV_RIGHT;
+        case 0x0104: return UI_EV_DOWN;
+        case 0x0101: return UI_EV_BACK;
         default:     return UI_EV_NONE;
     }
 }
@@ -288,65 +288,6 @@ void keypad_task(void *arg)
     }
 }
 
-
-// void keypad_task(void * arg)
-// {
-//     esp_log_level_set("*", ESP_LOG_INFO);
-//     ESP_LOGI(TAG, "matrix keypad polling scanner starting");
-//     //app_ctx_t *g = app_get_ctx();
-
-//     keypad_gpio_init();
-
-//     // init debounce state
-//     memset(stable, 0, sizeof(stable));
-//     memset(candidate, 0, sizeof(candidate));
-//     memset(count_same, 0, sizeof(count_same));
-
-//     uint8_t raw_cols[NR_COLS];
-
-//     while (1) {
-//         for (int r = 0; r < (int)NR_ROWS; r++) {
-//             read_row_raw(r, raw_cols);
-
-//             for (int c = 0; c < (int)NR_COLS; c++) {
-//                 uint8_t raw = raw_cols[c];
-
-//                 // debounce: count consecutive scans with same raw value
-//                 if (raw == candidate[r][c]) {
-//                     if (count_same[r][c] < 255) count_same[r][c]++;
-//                 } else {
-//                     candidate[r][c] = raw;
-//                     count_same[r][c] = 1;
-//                 }
-
-//                 // if raw has been stable long enough and differs from stable state -> commit + event
-//                 if (count_same[r][c] >= DEBOUNCE_SCANS && stable[r][c] != candidate[r][c]) {
-//                     stable[r][c] = candidate[r][c];
-//                     if (stable[r][c]) {
-
-//                         uint16_t code = make_key_code(r, c);
-//                         // xSemaphoreTake(g->state_mutex, portMAX_DELAY);
-//                         // g->keypad_event.key = (keypad_key_t)code;
-//                         // g->keypad_event.state = KEYPRESS_DOWN;
-//                         // xSemaphoreGive(g->state_mutex);
-
-//                         keypad_event_t ev = {
-//                             .key   = (keypad_key_t)code,
-//                             .state = KEYPRESS_DOWN,
-//                         };
-
-//                         // xQueueSend(g->key_event_q, &ev, portMAX_DELAY);
-//                         print_event("DOWN", r, c);
-//                     } else {
-//                         print_event("UP", r, c);
-//                     }
-//                 }
-//             }
-//         }
-
-//         vTaskDelay(pdMS_TO_TICKS(SCAN_PERIOD_MS));
-//     }
-// }
 
 void start_keypad_task(void *ui_q)
 {

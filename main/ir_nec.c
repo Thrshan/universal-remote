@@ -167,20 +167,6 @@ static void ir_worker_task(void *arg)
 
         if (cmd.type == APP_CMD_IR_LEARN_ONESHOT) {
             ESP_ERROR_CHECK(rmt_receive(s_rx_chan, s_rx_buf, sizeof(s_rx_buf), &rx_rcfg));
-            // esp_err_t err = ensure_rx_enabled();
-            // if (err != ESP_OK) {
-            //     app_evt_t e = {.type = APP_EVT_IR_LEARN_TIMEOUT};
-            //     app_post_evt(&e);
-            //     continue;
-            // }
-
-            // err = rmt_receive(s_rx_chan, s_rx_buf, sizeof(s_rx_buf), &rx_rcfg);
-            // if (err != ESP_OK) {
-            //     ESP_LOGE(TAG, "rmt_receive failed: %s", esp_err_to_name(err));
-            //     app_evt_t e = {.type = APP_EVT_IR_LEARN_TIMEOUT};
-            //     app_post_evt(&e);
-            //     continue;
-            // }
 
             rx_done_msg_t done;
             if (xQueueReceive(s_rx_done_q, &done, pdMS_TO_TICKS(cmd.learn.timeout_ms)) == pdTRUE) {
