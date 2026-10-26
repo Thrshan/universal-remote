@@ -17,7 +17,7 @@ static const char *TAG = "sh110x_oled";
 #define I2C_FREQ_HZ         400000
 
 #define OLED_I2C_ADDR       0x3C   // try 0x3D if not found
-#define OLED_RESET_GPIO     10     // set to -1 if not connected
+#define OLED_RESET_GPIO     (-1)   // four-wire I2C OLED; GPIO 10 belongs to the keypad
 // =========================
 
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
@@ -53,8 +53,7 @@ static void i2c_init(void)
 
 static void reset_gpio_init_if_needed(void)
 {
-    if (OLED_RESET_GPIO < 0) return;
-
+#if OLED_RESET_GPIO >= 0
     gpio_config_t io_conf = {
         .pin_bit_mask = 1ULL << OLED_RESET_GPIO,
         .mode = GPIO_MODE_OUTPUT,
@@ -69,6 +68,7 @@ static void reset_gpio_init_if_needed(void)
     vTaskDelay(pdMS_TO_TICKS(10));
     gpio_set_level(OLED_RESET_GPIO, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
+#endif
 }
 
 // ---- u8g2 GPIO+Delay callback ----

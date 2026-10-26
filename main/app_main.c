@@ -13,5 +13,5 @@ void app_main(void) {
     ir_start_tasks();
     app_ui_start();
     QueueHandle_t q = ui_get_queue();
-    start_keypad_task((void*)q);
+    start_keypad_task(q);
 }

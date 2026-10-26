@@ -1,295 +1,316 @@
 /*
- * ESP-IDF (v5.x) simple 4x4 matrix keypad scanner for ESP32-S3
- * - Polling scan every SCAN_PERIOD_MS
- * - Active-low rows, columns pulled up
- * - Debounce + press/release events
+ * SPDX-FileCopyrightText: 2020-2024 Espressif Systems (Shanghai) CO LTD
+ * SPDX-License-Identifier: Apache-2.0
  *
- * Wiring assumption:
- *   ROW pins = outputs (open-drain recommended), idle released/high
- *   COL pins = inputs with pull-up, read low when key pressed on active row
- *
- * Notes:
- *   - Choose GPIOs that are actually broken out on your board.
- *   - Avoid strapping / special pins, and avoid USB pins if your board uses USB.
+ * Eight-node remote keypad scanner, ported from matrix_keyboard.
+ * Each contact connects a pair of nodes; there are no fixed rows/columns.
+ * Drive one node low at a time and leave all other nodes as pulled-up inputs.
  */
 
-#include <stdio.h>
-#include <inttypes.h>
-#include <string.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
-#include "esp_log.h"
-#include "esp_err.h"
 #include "driver/gpio.h"
-#include "esp_rom_sys.h"   // esp_rom_delay_us()
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_rom_sys.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include "keypad.h"
 #include "ui_events.h"
-#include "freertos/queue.h"
-#include "esp_timer.h"
-// #include "app_state.h"
+
+#define KEYPAD_NODE_COUNT              8
+#define KEYPAD_SCAN_SETTLE_US          700
+#define KEYPAD_DEBOUNCE_SAMPLE_COUNT   5
+#define KEYPAD_DEBOUNCE_DELAY_MS       7
+#define KEYPAD_POLL_INTERVAL_MS        10
+#define KEYPAD_TASK_STACK_SIZE         4096
+#define KEYPAD_TASK_PRIORITY           5
+
+#define LONGPRESS_MS                  700
+#define REPEAT_DELAY_MS               350
+#define REPEAT_RATE_MS                120
 
 static const char *TAG = "keypad";
 
-// ---- Pin map (edit to match your board wiring) ----
-// static const gpio_num_t ROWS[] = { GPIO_NUM_15, GPIO_NUM_16, GPIO_NUM_18 };
-// static const gpio_num_t COLS[] = { GPIO_NUM_4, GPIO_NUM_6, GPIO_NUM_7 };
-static const gpio_num_t ROWS[] = { GPIO_NUM_12, GPIO_NUM_15, GPIO_NUM_16, GPIO_NUM_17 };
-static const gpio_num_t COLS[] = { GPIO_NUM_4, GPIO_NUM_6, GPIO_NUM_7, GPIO_NUM_10, GPIO_NUM_11 };
-#define NR_ROWS (sizeof(ROWS) / sizeof(ROWS[0]))
-#define NR_COLS (sizeof(COLS) / sizeof(COLS[0]))
+enum {
+    KEYPAD_UP = 5,
+    KEYPAD_LEFT = 6,
+    KEYPAD_OK = 7,
+    KEYPAD_RIGHT = 8,
+    KEYPAD_DOWN = 9,
+    KEYPAD_BACK = 10,
+};
 
-// ---- Scan/debounce tuning ----
-#define SCAN_PERIOD_MS      10    // scan every 10 ms
-#define SETTLE_US           30    // settle time after switching row
-#define DEBOUNCE_SCANS      3     // require same reading for 3 consecutive scans
+typedef struct {
+    int node_a;
+    int node_b;
+    int key;
+} keypad_key_map_t;
 
-#define LONGPRESS_MS        700
-#define REPEAT_ENABLE       1
-#define REPEAT_DELAY_MS     350
-#define REPEAT_RATE_MS      120
+typedef struct {
+    int key;
+    int node_a;
+    int node_b;
+    bool contact_detected;
+    bool ignored_pair;
+} keypad_scan_result_t;
 
-// state matrices: 1 = pressed, 0 = released
-static uint8_t stable[NR_ROWS][NR_COLS];
-static uint8_t candidate[NR_ROWS][NR_COLS];
-static uint8_t count_same[NR_ROWS][NR_COLS];
+// Node numbers in the contact map below are one-based, in this GPIO order.
+static const gpio_num_t s_keypad_nodes[KEYPAD_NODE_COUNT] = {
+    GPIO_NUM_4,
+    GPIO_NUM_7,
+    GPIO_NUM_15,
+    GPIO_NUM_16,
+    GPIO_NUM_17,
+    GPIO_NUM_10,
+    GPIO_NUM_11,
+    GPIO_NUM_6,
+};
 
-static uint32_t press_start_ms[NR_ROWS][NR_COLS];
-static uint8_t  long_sent[NR_ROWS][NR_COLS];
-static uint32_t last_repeat_ms[NR_ROWS][NR_COLS];
+static const keypad_key_map_t s_keypad_map[] = {
+    { 2, 3, 1 },
+    { 2, 5, 2 },
+    { 3, 5, 3 },
+    { 4, 5, 4 },
+    { 2, 6, 5 },
+    { 3, 6, 6 },
+    { 5, 6, 7 },
+    { 4, 6, 8 },
+    { 2, 7, 9 },
+    { 3, 7, 10 },
+    { 4, 7, 11 },
+    { 5, 7, 12 },
+    { 2, 8, 13 },
+    { 5, 8, 14 },
+    { 3, 8, 15 },
+    { 4, 8, 16 },
+    { 1, 3, 17 },
+    { 1, 5, 18 },
+    { 1, 2, 19 },
+    { 1, 6, 20 },
+    { 1, 4, 21 },
+};
 
-static inline uint32_t now_ms(void) {
+static uint32_t now_ms(void)
+{
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
-static ui_event_type_t map_key_to_ui_event(uint16_t code)
+static ui_event_type_t map_key_to_ui_event(int key)
 {
-
-//  KEYPAD_POWER    0x0003,
-//  KEYPAD_UP       0x0000,
-//  KEYPAD_DOWM     0x0104,
-//  KEYPAD_LEFT     0x0001,
-//  KEYPAD_RIGHT    0x0002,
-//  KEYPAD_OK       0x0004,
-//  KEYPAD_BACK     0x0101,
-//  KEYPAD_HOME     0x0102,
-//  KEYPAD_NUM_1    0x0100,
-//  KEYPAD_NUM_2    0x0103,
-//  KEYPAD_NUM_3    0x0202,
-//  KEYPAD_NUM_4    0x0200,
-//  KEYPAD_NUM_5    0x0204,
-//  KEYPAD_NUM_6    0x0203,
-//  KEYPAD_NUM_7    0x0201,
-//  KEYPAD_NUM_8    0x0300,
-//  KEYPAD_NUM_9    0x0303,
-//  KEYPAD_NUM_0    0x0301,
-
-    switch (code) {
-        case 0x0000: return UI_EV_UP;
-        case 0x0001: return UI_EV_LEFT;
-        case 0x0004: return UI_EV_OK;
-        case 0x0002: return UI_EV_RIGHT;
-        case 0x0104: return UI_EV_DOWN;
-        case 0x0101: return UI_EV_BACK;
-        default:     return UI_EV_NONE;
+    switch (key) {
+        case KEYPAD_UP:    return UI_EV_UP;
+        case KEYPAD_LEFT:  return UI_EV_LEFT;
+        case KEYPAD_OK:    return UI_EV_OK;
+        case KEYPAD_RIGHT: return UI_EV_RIGHT;
+        case KEYPAD_DOWN:  return UI_EV_DOWN;
+        case KEYPAD_BACK:  return UI_EV_BACK;
+        default:          return UI_EV_NONE;
     }
 }
 
-static ui_event_type_t map_key_to_ui_long(uint16_t code)
+static ui_event_type_t map_key_to_ui_long(int key)
 {
-    switch (code) {
-        case 0x0101: return UI_EV_OK_LONG;    // OK long
-        case 0x0200: return UI_EV_BACK_LONG;  // BACK long
-        default:     return UI_EV_NONE;
+    switch (key) {
+        case KEYPAD_OK:   return UI_EV_OK_LONG;
+        case KEYPAD_BACK: return UI_EV_BACK_LONG;
+        default:         return UI_EV_NONE;
     }
 }
 
-static bool key_allows_repeat(uint16_t code)
+static bool key_allows_repeat(int key)
 {
-    ui_event_type_t t = map_key_to_ui_event(code);
-    return (t == UI_EV_UP || t == UI_EV_DOWN || t == UI_EV_LEFT || t == UI_EV_RIGHT);
+    ui_event_type_t type = map_key_to_ui_event(key);
+    return type == UI_EV_UP || type == UI_EV_DOWN
+        || type == UI_EV_LEFT || type == UI_EV_RIGHT;
 }
 
 static void emit_ui(QueueHandle_t ui_q, ui_event_type_t type)
 {
-    if (!ui_q || type == UI_EV_NONE) return;
-    ui_event_t ev = {
+    if (type == UI_EV_NONE) {
+        return;
+    }
+
+    ui_event_t event = {
         .type = type,
-        .src  = UI_SRC_KEYPAD,
+        .src = UI_SRC_KEYPAD,
         .ts_ms = now_ms(),
-        .value = 0
+        .value = 0,
     };
-    xQueueSend(ui_q, &ev, 0);
-}
-
-
-// helper: configure rows/cols
-static void keypad_gpio_init(void)
-{
-    // Configure ROW pins: open-drain output, default released/high
-    for (int r = 0; r < (int)NR_ROWS; r++) {
-        gpio_config_t io = {
-            .pin_bit_mask = 1ULL << ROWS[r],
-            .mode = GPIO_MODE_OUTPUT_OD,       // open-drain output
-            .pull_up_en = GPIO_PULLUP_ENABLE,  // helps keep it high when released
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE
-        };
-        ESP_ERROR_CHECK(gpio_config(&io));
-        gpio_set_level(ROWS[r], 1); // released (Hi-Z), pulled up
-    }
-
-    // Configure COL pins: input with pull-up
-    for (int c = 0; c < (int)NR_COLS; c++) {
-        gpio_config_t io = {
-            .pin_bit_mask = 1ULL << COLS[c],
-            .mode = GPIO_MODE_INPUT,
-            .pull_up_en = GPIO_PULLUP_ENABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE
-        };
-        ESP_ERROR_CHECK(gpio_config(&io));
+    if (xQueueSend(ui_q, &event, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "UI queue full; dropped event %d", (int)type);
     }
 }
 
-// Read current raw pressed state for one row (pressed=1, released=0)
-static void read_row_raw(int row, uint8_t out_cols[NR_COLS])
+static void keypad_normalize_pair(int *node_a, int *node_b)
 {
-    // Release all rows first (prevents ghost effects while switching)
-    for (int r = 0; r < (int)NR_ROWS; r++) {
-        gpio_set_level(ROWS[r], 1); // release
+    if (*node_a > *node_b) {
+        int tmp = *node_a;
+        *node_a = *node_b;
+        *node_b = tmp;
+    }
+}
+
+static void keypad_set_all_inputs_pullup(void)
+{
+    uint64_t pin_bit_mask = 0;
+    for (int node_idx = 0; node_idx < KEYPAD_NODE_COUNT; node_idx++) {
+        pin_bit_mask |= 1ULL << s_keypad_nodes[node_idx];
     }
 
-    // Activate this row (active-low)
-    gpio_set_level(ROWS[row], 0);
+    gpio_config_t config = {
+        .pin_bit_mask = pin_bit_mask,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&config));
+}
 
-    // Let signals settle
-    esp_rom_delay_us(SETTLE_US);
+static int keypad_pair_to_key(int node_a, int node_b)
+{
+    keypad_normalize_pair(&node_a, &node_b);
+    for (size_t map_idx = 0; map_idx < sizeof(s_keypad_map) / sizeof(s_keypad_map[0]); map_idx++) {
+        if (s_keypad_map[map_idx].node_a == node_a && s_keypad_map[map_idx].node_b == node_b) {
+            return s_keypad_map[map_idx].key;
+        }
+    }
+    return 0;
+}
 
-    // Read all columns
-    for (int c = 0; c < (int)NR_COLS; c++) {
-        int level = gpio_get_level(COLS[c]);   // 1 = pulled up, 0 = pulled down by key press
-        out_cols[c] = (level == 0) ? 1 : 0;    // pressed=1 if column reads low
+static keypad_scan_result_t keypad_scan_raw_result(void)
+{
+    keypad_scan_result_t result = { 0 };
+
+    for (int drive_idx = 0; drive_idx < KEYPAD_NODE_COUNT; drive_idx++) {
+        keypad_set_all_inputs_pullup();
+
+        // Preload the low level before enabling the output to avoid a high pulse.
+        ESP_ERROR_CHECK(gpio_set_level(s_keypad_nodes[drive_idx], 0));
+        ESP_ERROR_CHECK(gpio_set_direction(s_keypad_nodes[drive_idx], GPIO_MODE_OUTPUT));
+        esp_rom_delay_us(KEYPAD_SCAN_SETTLE_US);
+
+        for (int sense_idx = 0; sense_idx < KEYPAD_NODE_COUNT; sense_idx++) {
+            if (sense_idx == drive_idx) {
+                continue;
+            }
+            if (gpio_get_level(s_keypad_nodes[sense_idx]) == 0) {
+                result.node_a = drive_idx + 1;
+                result.node_b = sense_idx + 1;
+                keypad_normalize_pair(&result.node_a, &result.node_b);
+                result.contact_detected = true;
+                result.ignored_pair = result.node_a == 7 && result.node_b == 8;
+                result.key = keypad_pair_to_key(result.node_a, result.node_b);
+                keypad_set_all_inputs_pullup();
+                return result;
+            }
+        }
     }
 
-    // Deactivate row
-    gpio_set_level(ROWS[row], 1);
+    keypad_set_all_inputs_pullup();
+    return result;
 }
 
-static inline uint16_t make_key_code(int row, int col)
+static bool keypad_scan_results_match(const keypad_scan_result_t *a, const keypad_scan_result_t *b)
 {
-    // same style as many examples: upper byte=row, lower byte=col
-    return (uint16_t)((row << 8) | (col & 0xFF));
+    return a->key == b->key && a->node_a == b->node_a && a->node_b == b->node_b
+        && a->contact_detected == b->contact_detected && a->ignored_pair == b->ignored_pair;
 }
 
-static void print_event(const char *what, int row, int col)
+// Return false for an unstable scan, rather than treating bounce as a release.
+static bool keypad_scan_debounced(keypad_scan_result_t *result)
 {
-    uint16_t code = make_key_code(row, col);
-    ESP_LOGI(TAG, "%s: row=%d col=%d code=0x%04" PRIx16, what, row, col, code);
+    keypad_scan_result_t stable_result = keypad_scan_raw_result();
+    TickType_t delay_ticks = pdMS_TO_TICKS(KEYPAD_DEBOUNCE_DELAY_MS);
+    // The project's 100 Hz tick rounds 7 ms down to zero; always sleep a tick.
+    if (delay_ticks == 0) {
+        delay_ticks = 1;
+    }
+
+    for (int sample = 1; sample < KEYPAD_DEBOUNCE_SAMPLE_COUNT; sample++) {
+        vTaskDelay(delay_ticks);
+        keypad_scan_result_t raw_result = keypad_scan_raw_result();
+        if (!keypad_scan_results_match(&raw_result, &stable_result)) {
+            return false;
+        }
+    }
+
+    *result = stable_result;
+    return true;
 }
 
-void keypad_task(void *arg)
+static void keypad_task(void *arg)
 {
     QueueHandle_t ui_q = (QueueHandle_t)arg;
+    int last_key = 0;
+    int last_unmapped_node_a = 0;
+    int last_unmapped_node_b = 0;
+    uint32_t press_start_ms = 0;
+    uint32_t last_repeat_ms = 0;
+    bool long_sent = false;
 
-    esp_log_level_set("*", ESP_LOG_INFO);
-    ESP_LOGI(TAG, "matrix keypad polling scanner starting");
-
-    keypad_gpio_init();
-
-    memset(stable, 0, sizeof(stable));
-    memset(candidate, 0, sizeof(candidate));
-    memset(count_same, 0, sizeof(count_same));
-    memset(press_start_ms, 0, sizeof(press_start_ms));
-    memset(long_sent, 0, sizeof(long_sent));
-    memset(last_repeat_ms, 0, sizeof(last_repeat_ms));
-
-    uint8_t raw_cols[NR_COLS];
+    keypad_set_all_inputs_pullup();
+    ESP_LOGI(TAG, "eight-node keypad starting: 5=Up 6=Left 7=OK 8=Right 9=Down 10=Back");
 
     while (1) {
-        uint32_t t = now_ms();
+        keypad_scan_result_t current_result;
+        if (keypad_scan_debounced(&current_result)) {
+            int current_key = current_result.key;
+            uint32_t t = now_ms();
 
-        for (int r = 0; r < (int)NR_ROWS; r++) {
-            read_row_raw(r, raw_cols);
-
-            for (int c = 0; c < (int)NR_COLS; c++) {
-                uint8_t raw = raw_cols[c];
-
-                if (raw == candidate[r][c]) {
-                    if (count_same[r][c] < 255) count_same[r][c]++;
-                } else {
-                    candidate[r][c] = raw;
-                    count_same[r][c] = 1;
+            if (current_key != last_key) {
+                if (last_key != 0) {
+                    ESP_LOGI(TAG, "release event, key = %d", last_key);
                 }
-
-                if (count_same[r][c] >= DEBOUNCE_SCANS && stable[r][c] != candidate[r][c]) {
-                    stable[r][c] = candidate[r][c];
-
-                    uint16_t code = make_key_code(r, c);
-
-                    if (stable[r][c]) {
-                        // DOWN
-                        press_start_ms[r][c] = t;
-                        long_sent[r][c] = 0;
-                        last_repeat_ms[r][c] = t;
-
-                        print_event("DOWN", r, c);
-
-                        ui_event_type_t ev = map_key_to_ui_event(code);
-                        emit_ui(ui_q, ev);
-
-                    } else {
-                        // UP
-                        print_event("UP", r, c);
-                        press_start_ms[r][c] = 0;
-                        long_sent[r][c] = 0;
-                        last_repeat_ms[r][c] = 0;
-                    }
+                if (current_key != 0) {
+                    ESP_LOGI(TAG, "press event, key = %d", current_key);
+                    emit_ui(ui_q, map_key_to_ui_event(current_key));
                 }
+                last_key = current_key;
+                press_start_ms = t;
+                last_repeat_ms = t;
+                long_sent = false;
+            }
+
+            if (current_key != 0) {
+                uint32_t held_ms = t - press_start_ms;
+                if (!long_sent && held_ms >= LONGPRESS_MS) {
+                    emit_ui(ui_q, map_key_to_ui_long(current_key));
+                    long_sent = true;
+                }
+                if (key_allows_repeat(current_key) && held_ms >= REPEAT_DELAY_MS
+                    && t - last_repeat_ms >= REPEAT_RATE_MS) {
+                    emit_ui(ui_q, map_key_to_ui_event(current_key));
+                    last_repeat_ms = t;
+                }
+            }
+
+            if (current_result.contact_detected && current_key == 0 && !current_result.ignored_pair) {
+                if (current_result.node_a != last_unmapped_node_a || current_result.node_b != last_unmapped_node_b) {
+                    ESP_LOGW(TAG, "unmapped contact pair, node %d GPIO %d - node %d GPIO %d",
+                             current_result.node_a, s_keypad_nodes[current_result.node_a - 1],
+                             current_result.node_b, s_keypad_nodes[current_result.node_b - 1]);
+                    last_unmapped_node_a = current_result.node_a;
+                    last_unmapped_node_b = current_result.node_b;
+                }
+            } else {
+                last_unmapped_node_a = 0;
+                last_unmapped_node_b = 0;
             }
         }
 
-        // Long press + repeat pass (based on debounced stable[][])
-        for (int r = 0; r < (int)NR_ROWS; r++) {
-            for (int c = 0; c < (int)NR_COLS; c++) {
-                if (!stable[r][c]) continue; // not pressed
-
-                uint16_t code = make_key_code(r, c);
-
-                // long press
-                if (!long_sent[r][c] && press_start_ms[r][c] != 0) {
-                    if ((t - press_start_ms[r][c]) >= LONGPRESS_MS) {
-                        ui_event_type_t lev = map_key_to_ui_long(code);
-                        if (lev != UI_EV_NONE) {
-                            emit_ui(ui_q, lev);
-                            long_sent[r][c] = 1;
-                            ESP_LOGI(TAG, "LONG: code=0x%04x", code);
-                        }
-                    }
-                }
-
-#if REPEAT_ENABLE
-                // repeat
-                if (key_allows_repeat(code) && press_start_ms[r][c] != 0) {
-                    uint32_t held = t - press_start_ms[r][c];
-                    if (held >= REPEAT_DELAY_MS) {
-                        if ((t - last_repeat_ms[r][c]) >= REPEAT_RATE_MS) {
-                            emit_ui(ui_q, map_key_to_ui_event(code));
-                            last_repeat_ms[r][c] = t;
-                        }
-                    }
-                }
-#endif
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(SCAN_PERIOD_MS));
+        vTaskDelay(pdMS_TO_TICKS(KEYPAD_POLL_INTERVAL_MS));
     }
 }
 
-
-void start_keypad_task(void *ui_q)
+void start_keypad_task(QueueHandle_t ui_q)
 {
-        xTaskCreate(keypad_task, "keypad_task", 4096, ui_q, 5, NULL);
+    ESP_ERROR_CHECK(ui_q != NULL ? ESP_OK : ESP_ERR_INVALID_ARG);
+    ESP_ERROR_CHECK(xTaskCreate(keypad_task, "keypad_task", KEYPAD_TASK_STACK_SIZE,
+                               ui_q, KEYPAD_TASK_PRIORITY, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }
