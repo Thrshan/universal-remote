@@ -67,16 +67,20 @@ void ui_nav_dispatch(ui_ctx_t *ctx, const ui_event_t *event)
     if (!current) return;
     if ((event->type == UI_EV_KEY_RELEASE || event->type == UI_EV_POWER_LONG)
         && current->id != UI_SCREEN_REMOTE) return;
-    bool learning_screen = current->id == UI_SCREEN_IR_KEYS
+    remote_t remote;
+    bool bt_picker = current->id == UI_SCREEN_BT_KEYS
+        && app_remote_get(ctx->active_remote, &remote) && remote.bt.preset >= BT_PRESET_TEXT;
+    bool learning_screen = current->id == UI_SCREEN_IR_KEYS || bt_picker
         || current->id == UI_SCREEN_IR_REPLACE || current->id == UI_SCREEN_IR_WAIT
         || current->id == UI_SCREEN_IR_RESULT;
     if (event->type == UI_EV_BACK && !event->repeat) {
         ctx->back_target_top = learning_screen ? ctx->top - 1 : -1;
         // Short BACK selects its binding on the key picker. On IR details it
         // waits for the hold, so pressing BACK cannot cancel its own recording.
-        if (learning_screen && current->id != UI_SCREEN_IR_KEYS) return;
+        if (learning_screen && current->id != UI_SCREEN_IR_KEYS && !bt_picker) return;
     }
-    if (event->type == UI_EV_BACK_LONG && learning_screen && ctx->back_target_top >= 0) {
+    if (event->type == UI_EV_BACK_LONG && (learning_screen || current->id == UI_SCREEN_BT_BINDING
+        || current->id == UI_SCREEN_BT_TEXT) && ctx->back_target_top >= 0) {
         // A hold may have opened the BACK recording screen on its initial
         // press. Return relative to the original screen, avoiding that detour.
         int target = ctx->back_target_top;
@@ -88,7 +92,7 @@ void ui_nav_dispatch(ui_ctx_t *ctx, const ui_event_t *event)
     // short HOME is learnable; a hold always finishes setup.
     if (current->id != UI_SCREEN_SPLASH && current->id != UI_SCREEN_REMOTE
         && (event->type == UI_EV_HOME_LONG
-            || (event->type == UI_EV_HOME && current->id != UI_SCREEN_IR_KEYS))) {
+            || (event->type == UI_EV_HOME && current->id != UI_SCREEN_IR_KEYS && !bt_picker))) {
         ui_nav_home(ctx);
         return;
     }

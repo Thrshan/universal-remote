@@ -7,7 +7,7 @@
 
 uint32_t host_time;
 int host_fail_save;
-static uint8_t saved[16384], staged[16384], legacy[1024];
+static uint8_t saved[32768], staged[32768], legacy[1024];
 static size_t saved_size, staged_size, legacy_size;
 struct host_queue { unsigned count, size, head, tail; uint8_t *data; };
 QueueHandle_t xQueueCreate(unsigned count, unsigned size)
@@ -56,6 +56,7 @@ esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *blob, size_t 
     (void)key;
     size_t length = handle == 2 ? legacy_size : saved_size;
     if (!length) return ESP_ERR_NVS_NOT_FOUND;
+    if (!blob) { *size = length; return ESP_OK; }
     if (*size < length) return ESP_ERR_INVALID_SIZE;
     memcpy(blob, handle == 2 ? legacy : saved, length);
     *size = length;
@@ -81,6 +82,16 @@ esp_err_t nvs_commit(nvs_handle_t handle)
 void nvs_close(nvs_handle_t handle) { (void)handle; }
 void host_clear_storage(void) { saved_size = staged_size = legacy_size = 0; host_fail_save = 0; }
 void host_corrupt_storage(void) { assert(saved_size); saved[20] ^= 1; }
+void host_v1_storage(const remote_t *remote)
+{
+    struct { uint32_t magic; uint16_t version, count; remote_t remotes[MAX_REMOTES]; uint32_t checksum; } blob = {0};
+    blob.magic = 0x554E4952u; blob.version = 1; blob.count = 1; blob.remotes[0] = *remote;
+    const uint8_t *bytes = (const uint8_t *)&blob;
+    blob.checksum = 2166136261u;
+    for (size_t i = 0; i < sizeof(blob) - sizeof(blob.checksum); ++i)
+        blob.checksum = (blob.checksum ^ bytes[i]) * 16777619u;
+    memcpy(saved, &blob, sizeof(blob)); saved_size = sizeof(blob);
+}
 void host_legacy_storage(unsigned count)
 {
     typedef struct { char name[8]; ir_nec_code_t code; } slot_t;

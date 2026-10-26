@@ -18,7 +18,7 @@ static void center(u8g2_t *u8, int y, const char *text)
     const uint8_t *font = u8->font;
     // Keep long names readable in full instead of clipping the larger font.
     if (u8g2_GetStrWidth(u8, text) > UI_WIDTH - 4) u8g2_SetFont(u8, u8g2_font_5x8_tf);
-    if (u8g2_GetStrWidth(u8, text) > UI_WIDTH) u8g2_SetFont(u8, u8g2_font_4x6_tf);
+    if (u8g2_GetStrWidth(u8, text) > UI_WIDTH - 4) u8g2_SetFont(u8, u8g2_font_4x6_tf);
     int width = u8g2_GetStrWidth(u8, text);
     u8g2_DrawStr(u8, width < UI_WIDTH ? (UI_WIDTH - width) / 2 : 0, y, text);
     u8g2_SetFont(u8, font);
@@ -48,6 +48,7 @@ static void row(u8g2_t *u8, int y, const char *text, bool selected)
     }
     u8g2_SetFont(u8, u8g2_font_6x10_tf);
     if (u8g2_GetStrWidth(u8, text) > 56) u8g2_SetFont(u8, u8g2_font_5x8_tf);
+    if (u8g2_GetStrWidth(u8, text) > 56) u8g2_SetFont(u8, u8g2_font_4x6_tf);
     u8g2_DrawStr(u8, 4, y + 11, text);
     u8g2_SetDrawColor(u8, 1);
 }
@@ -188,22 +189,24 @@ static void remote_handle(ui_ctx_t *ctx, const ui_event_t *event)
     remote_t remote;
     if (!remote_key_assignable(key) || !app_remote_get(ctx->active_remote, &remote)) return;
     if (remote.transport == REMOTE_BT && remote.bt.kind == BT_REMOTE_KEYBOARD) {
+        bool fire_power = remote.bt.preset == BT_PRESET_FIRE_TV && key == REMOTE_KEY_POWER;
         bool long_power = event->type == UI_EV_POWER_LONG && key == REMOTE_KEY_POWER;
         if (event->type == UI_EV_KEY_RELEASE) {
-            if (key != REMOTE_KEY_POWER || !ctx->bt_power_pending) return;
+            if (!fire_power || !ctx->bt_power_pending) return;
             ctx->bt_power_pending = false;
-        } else if (key == REMOTE_KEY_POWER && !long_power) {
+        } else if (fire_power && !long_power) {
             if (!event->repeat) ctx->bt_power_pending = true;
             return; // Short power is sent on release; a hold sends only Ctrl+Alt+Del.
         } else if (long_power) {
-            if (!ctx->bt_power_pending) return;
+            if (!fire_power || !ctx->bt_power_pending) return;
             ctx->bt_power_pending = false;
         }
-        bt_key_report_t report;
         ctx->last_key = key;
-        if (!bt_keymap_report(key, long_power, &report)) {
+        if (!bt_profile_key_assigned(&remote, key)) {
             snprintf(ctx->tx_status, sizeof(ctx->tx_status), "Unassigned"); return;
         }
+        // A held arrow/channel key must not repeatedly type an entire string.
+        if (remote.bt.preset == BT_PRESET_TEXT && event->repeat) return;
         ctx->tx_request = ++ctx->sequence;
         if (bt_keyboard_tap(ctx->bt_session, ctx->tx_request, key, long_power))
             snprintf(ctx->tx_status, sizeof(ctx->tx_status), "%s", long_power ? "CtrlAltDel" : "Sending...");
@@ -339,7 +342,7 @@ static void bt_type_render(ui_ctx_t *ctx, u8g2_t *u8)
     row(u8, 49, "Mouse", ctx->bt_type_sel == 1);
     row(u8, 70, "Controller", ctx->bt_type_sel == 2);
     u8g2_SetFont(u8, u8g2_font_5x8_tf);
-    center(u8, 102, ctx->bt_type_sel ? "On hold" : "Fire TV keys");
+    center(u8, 102, ctx->bt_type_sel ? "On hold" : "Choose preset");
     footer(ctx, u8, "OK:select", "BACK:connect");
 }
 static void bt_device_handle(ui_ctx_t *ctx, const ui_event_t *event)
@@ -410,6 +413,28 @@ static void bt_confirm_render(ui_ctx_t *ctx, u8g2_t *u8)
 }
 static void bt_keys_handle(ui_ctx_t *ctx, const ui_event_t *event)
 {
+    remote_t remote;
+    if (!app_remote_get(ctx->active_remote, &remote)) return;
+    if (remote.bt.preset >= BT_PRESET_TEXT) {
+        if (event->type == UI_EV_MODE) { ui_nav_pop(ctx); return; }
+        if (event->src != UI_SRC_KEYPAD || event->repeat || !remote_key_assignable(event->value)
+            || event->type == UI_EV_BACK_LONG || event->type == UI_EV_HOME_LONG
+            || event->type == UI_EV_OK_LONG) return;
+        ctx->bt_key_sel = event->value;
+        if (remote.bt.preset == BT_PRESET_TEXT) {
+            app_remote_get_bt_text(ctx->active_remote, ctx->bt_key_sel, ctx->bt_text_draft);
+            ctx->keyboard_sel = ctx->keyboard_page = 0;
+            ui_nav_push(ctx, UI_SCREEN_BT_TEXT, NULL);
+        } else {
+            bt_binding_t binding = bt_profile_binding(&remote, ctx->bt_key_sel);
+            ctx->bt_binding_sel = 0;
+            for (unsigned i = 0; i < bt_keycode_count(); ++i)
+                if (bt_keycode_at(i) == binding.keycode) ctx->bt_binding_sel = i;
+            ctx->bt_modifiers = binding.modifiers;
+            ui_nav_push(ctx, UI_SCREEN_BT_BINDING, NULL);
+        }
+        return;
+    }
     if (event->type == UI_EV_BACK) { ui_nav_pop(ctx); return; }
     if (event->type == UI_EV_UP && ctx->bt_key_sel > 1) {
         --ctx->bt_key_sel;
@@ -422,21 +447,80 @@ static void bt_keys_handle(ui_ctx_t *ctx, const ui_event_t *event)
 }
 static void bt_keys_render(ui_ctx_t *ctx, u8g2_t *u8)
 {
+    remote_t remote;
+    if (!app_remote_get(ctx->active_remote, &remote)) return;
     title(u8, "Key map", "BT");
     u8g2_SetFont(u8, u8g2_font_5x8_tf);
-    center(u8, 31, "Fire TV preset");
+    center(u8, 31, bt_preset_name(remote.bt.preset));
+    if (remote.bt.preset >= BT_PRESET_TEXT) {
+        u8g2_SetFont(u8, u8g2_font_6x10_tf);
+        center(u8, 51, "Press a key");
+        center(u8, 64, "to assign");
+        u8g2_SetFont(u8, u8g2_font_5x8_tf);
+        char count[24];
+        snprintf(count, sizeof(count), "%u/20 assigned", remote_assigned_count(&remote));
+        center(u8, 83, count);
+        center(u8, 99, "MODE:done");
+        footer(ctx, u8, "Hold BACK:", "BT menu");
+        return;
+    }
     u8g2_SetFont(u8, u8g2_font_6x10_tf);
     center(u8, 53, remote_key_name(ctx->bt_key_sel));
-    center(u8, 72, bt_keymap_label(ctx->bt_key_sel));
+    bt_binding_t binding = bt_profile_binding(&remote, ctx->bt_key_sel);
+    center(u8, 72, binding.keycode ? bt_keycode_label(binding.keycode) : "Unassigned");
     u8g2_SetFont(u8, u8g2_font_5x8_tf);
-    if (ctx->bt_key_sel == REMOTE_KEY_POWER) {
+    if (remote.bt.preset == BT_PRESET_FIRE_TV && ctx->bt_key_sel == REMOTE_KEY_POWER) {
         center(u8, 91, "Hold POWER:"); center(u8, 102, "Ctrl+Alt+Del");
     } else center(u8, 99, "Mapping fixed");
     footer(ctx, u8, "UP/DOWN:keys", "BACK:BT menu");
 }
+
+static void bt_binding_handle(ui_ctx_t *ctx, const ui_event_t *event)
+{
+    if (event->type == UI_EV_BACK) { ui_nav_pop(ctx); return; }
+    if (event->type == UI_EV_KEY && !event->repeat) {
+        if (event->value == REMOTE_KEY_CUSTOM4) ctx->bt_modifiers ^= 1;
+        if (event->value == REMOTE_KEY_CUSTOM5) ctx->bt_modifiers ^= 2;
+        if (event->value == REMOTE_KEY_CUSTOM6) ctx->bt_modifiers ^= 4;
+    }
+    unsigned *selected = &ctx->bt_binding_sel, count = bt_keycode_count();
+    if (event->type == UI_EV_LEFT && *selected % 2) --*selected;
+    if (event->type == UI_EV_RIGHT && !(*selected % 2) && *selected + 1 < count) ++*selected;
+    if (event->type == UI_EV_UP && *selected >= 2) *selected -= 2;
+    if (event->type == UI_EV_DOWN && *selected + 2 < count) *selected += 2;
+    if (event->type != UI_EV_OK) return;
+    bt_binding_t binding = {.keycode = bt_keycode_at(*selected), .modifiers = *selected ? ctx->bt_modifiers : 0};
+    if (app_remote_set_bt_binding(ctx->active_remote, ctx->bt_key_sel, binding) == ESP_OK) {
+        ui_nav_pop(ctx); notice(ctx, binding.keycode ? "Key saved" : "Key cleared");
+    } else notice(ctx, "Save failed");
+}
+
+static void bt_binding_render(ui_ctx_t *ctx, u8g2_t *u8)
+{
+    title(u8, remote_key_name(ctx->bt_key_sel), NULL);
+    char modifiers[32];
+    snprintf(modifiers, sizeof(modifiers), "%s%s%s", ctx->bt_modifiers & 1 ? "Ctrl+" : "",
+        ctx->bt_modifiers & 2 ? "Shift+" : "", ctx->bt_modifiers & 4 ? "Alt+" : "");
+    u8g2_SetFont(u8, u8g2_font_5x8_tf);
+    center(u8, 25, modifiers[0] ? modifiers : "No modifiers");
+    center(u8, 36, bt_keycode_label(bt_keycode_at(ctx->bt_binding_sel)));
+    unsigned first = (ctx->bt_binding_sel / 10) * 10;
+    unsigned last_page = bt_keycode_count() > 10 ? ((bt_keycode_count() - 10 + 1) / 2) * 2 : 0;
+    if (first > last_page) first = last_page;
+    for (unsigned i = first; i < first + 10 && i < bt_keycode_count(); ++i) {
+        int x = (i % 2) * 32, y = 42 + ((i - first) / 2) * 13;
+        if (i == ctx->bt_binding_sel) { u8g2_DrawBox(u8, x, y, 31, 12); u8g2_SetDrawColor(u8, 0); }
+        u8g2_SetFont(u8, u8g2_font_4x6_tf);
+        u8g2_DrawStr(u8, x + 2, y + 8, bt_keycode_label(bt_keycode_at(i)));
+        u8g2_SetDrawColor(u8, 1);
+    }
+    footer(ctx, u8, "4:Ctrl 5:Shift", "6:Alt OK:save");
+}
 static char keyboard_char(unsigned page, unsigned index)
 {
     static const char numbers[] = "0123456789.-_!?@#:/()+*=&%,;";
+    static const char symbols[] = "[]{}\\|\"'$%^<>~`-+=:;!?@#&*";
+    if (page == 3) return symbols[index % (sizeof(symbols) - 1)];
     return page == 2 ? numbers[index] : (char)((page == 1 ? 'A' : 'a') + index);
 }
 static void name_next(ui_ctx_t *ctx)
@@ -478,15 +562,20 @@ static void name_handle(ui_ctx_t *ctx, const ui_event_t *event)
 }
 static void name_render(ui_ctx_t *ctx, u8g2_t *u8)
 {
+    bool text = screen_id(ctx) == UI_SCREEN_BT_TEXT;
+    const char *value = text ? ctx->bt_text_draft : ctx->draft.name;
+    size_t length = strlen(value);
     char counter[24];
-    snprintf(counter, sizeof(counter), "%u/12", (unsigned)strlen(ctx->draft.name));
-    title(u8, "Name", counter);
+    snprintf(counter, sizeof(counter), "%u/%u", (unsigned)length, text ? BT_TEXT_MAX : REMOTE_NAME_MAX);
+    title(u8, text ? "Text" : "Name", counter);
     u8g2_DrawFrame(u8, 1, 19, 62, 24);
     u8g2_SetFont(u8, u8g2_font_6x10_tf);
     char first[10];
-    snprintf(first, sizeof(first), "%.9s", ctx->draft.name);
+    // Keep the end of a long string visible while entering it.
+    if (text && length > 18) value += length - 18;
+    snprintf(first, sizeof(first), "%.9s", value);
     u8g2_DrawStr(u8, 4, 29, first);
-    u8g2_DrawStr(u8, 4, 39, strlen(ctx->draft.name) > 9 ? ctx->draft.name + 9 : "_");
+    u8g2_DrawStr(u8, 4, 39, strlen(value) > 9 ? value + 9 : "_");
     for (unsigned i = 0; i < 30; ++i) {
         int x = 2 + (i % 5) * 12, y = 46 + (i / 5) * 11;
         bool selected = ctx->keyboard_sel == i;
@@ -501,11 +590,37 @@ static void name_render(ui_ctx_t *ctx, u8g2_t *u8)
         u8g2_DrawStr(u8, x + (11 - u8g2_GetStrWidth(u8, label)) / 2, y + 7, label);
         u8g2_SetDrawColor(u8, 1);
     }
-    static const char *const pages[] = {"abc", "ABC", "123"};
+    static const char *const pages[] = {"abc", "ABC", "123", "#+="};
     char hint[17];
     snprintf(hint, sizeof(hint), "CUST:%s", pages[ctx->keyboard_page]);
-    footer(ctx, u8, hint, "OK:key ->:go");
+    footer(ctx, u8, hint, text ? "OK:key ->:save" : "OK:key ->:go");
 }
+static void bt_text_handle(ui_ctx_t *ctx, const ui_event_t *event)
+{
+    if (event->type == UI_EV_BACK) { ui_nav_pop(ctx); return; }
+    if (event->type == UI_EV_KEY && custom_key(event->value) && !event->repeat) {
+        ctx->keyboard_page = (ctx->keyboard_page + 1) % 4; return;
+    }
+    unsigned *selected = &ctx->keyboard_sel;
+    if (event->type == UI_EV_LEFT && *selected % 5) --*selected;
+    if (event->type == UI_EV_RIGHT && *selected % 5 < 4) ++*selected;
+    if (event->type == UI_EV_UP && *selected >= 5) *selected -= 5;
+    if (event->type == UI_EV_DOWN && *selected < 25) *selected += 5;
+    if (event->type != UI_EV_OK) return;
+    size_t length = strlen(ctx->bt_text_draft);
+    if (*selected == 29) {
+        if (app_remote_set_bt_text(ctx->active_remote, ctx->bt_key_sel, ctx->bt_text_draft) == ESP_OK) {
+            ui_nav_pop(ctx); notice(ctx, length ? "Text saved" : "Key cleared");
+        } else notice(ctx, "Save failed");
+        return;
+    }
+    if (*selected == 28) { ctx->keyboard_page = (ctx->keyboard_page + 1) % 4; return; }
+    if (*selected == 27) { if (length) ctx->bt_text_draft[length - 1] = 0; return; }
+    if (length >= BT_TEXT_MAX) { notice(ctx, "64 char max"); return; }
+    ctx->bt_text_draft[length] = *selected == 26 ? ' ' : keyboard_char(ctx->keyboard_page, *selected);
+    ctx->bt_text_draft[length + 1] = 0;
+}
+static void create_remote(ui_ctx_t *ctx);
 static void icon_handle(ui_ctx_t *ctx, const ui_event_t *event)
 {
     if (event->type == UI_EV_BACK) { ui_nav_pop(ctx); return; }
@@ -523,6 +638,13 @@ static void icon_handle(ui_ctx_t *ctx, const ui_event_t *event)
         else notice(ctx, "Save failed");
         return;
     }
+    if (ctx->draft.transport == REMOTE_BT) {
+        ctx->bt_preset_sel = ctx->draft.bt.preset;
+        ui_nav_push(ctx, UI_SCREEN_BT_PRESET, NULL);
+    } else create_remote(ctx);
+}
+static void create_remote(ui_ctx_t *ctx)
+{
     unsigned index;
     if (app_remote_create(&ctx->draft, &index) != ESP_OK) { notice(ctx, "Save failed"); return; }
     unsigned transport = ctx->draft.transport;
@@ -534,6 +656,10 @@ static void icon_handle(ui_ctx_t *ctx, const ui_event_t *event)
         if (app_remote_get(index, &remote) && open_bt(ctx, &remote)) {
             ctx->bt_menu_sel = 0;
             ui_nav_push(ctx, UI_SCREEN_BT_DEVICE, NULL);
+            if (remote.bt.preset >= BT_PRESET_TEXT) {
+                ctx->bt_key_sel = 1;
+                ui_nav_push(ctx, UI_SCREEN_BT_KEYS, NULL);
+            }
         }
     } else ui_nav_push(ctx, transport == REMOTE_IR ? UI_SCREEN_IR_KEYS : UI_SCREEN_CONSTRUCTION, NULL);
 }
@@ -554,8 +680,27 @@ static void icon_render(ui_ctx_t *ctx, u8g2_t *u8)
     }
     u8g2_SetFont(u8, u8g2_font_6x10_tf);
     center(u8, 105, ui_icon_name(ctx->icon_sel));
-    footer(ctx, u8, ctx->editing ? "OK:save icon" : "OK:create",
+    footer(ctx, u8, ctx->editing ? "OK:save icon" : ctx->draft.transport == REMOTE_BT ? "OK:preset" : "OK:create",
            ctx->editing ? "BACK:editor" : "BACK:name");
+}
+static void bt_preset_handle(ui_ctx_t *ctx, const ui_event_t *event)
+{
+    if (event->type == UI_EV_BACK) { ui_nav_pop(ctx); return; }
+    if (event->type == UI_EV_UP && ctx->bt_preset_sel) --ctx->bt_preset_sel;
+    if (event->type == UI_EV_DOWN && ctx->bt_preset_sel < BT_PRESET_CUSTOM) ++ctx->bt_preset_sel;
+    if (event->type != UI_EV_OK) return;
+    ctx->draft.bt.preset = ctx->bt_preset_sel;
+    memset(ctx->draft.bt.bindings, 0, sizeof(ctx->draft.bt.bindings));
+    ctx->draft.assigned = 0;
+    ctx->draft.assigned = bt_profile_mask(&ctx->draft);
+    create_remote(ctx);
+}
+static void bt_preset_render(ui_ctx_t *ctx, u8g2_t *u8)
+{
+    title(u8, "BT preset", NULL);
+    for (unsigned i = 0; i <= BT_PRESET_CUSTOM; ++i)
+        row(u8, 24 + i * 21, bt_preset_name(i), ctx->bt_preset_sel == i);
+    footer(ctx, u8, "OK:select", "BACK:icon");
 }
 void ui_cancel_learning(ui_ctx_t *ctx)
 {
@@ -766,6 +911,9 @@ static void screen_handle(ui_ctx_t *ctx, const ui_event_t *event)
         case UI_SCREEN_BT_DEVICE: bt_device_handle(ctx, event); break;
         case UI_SCREEN_BT_CONFIRM: bt_confirm_handle(ctx, event); break;
         case UI_SCREEN_BT_KEYS: bt_keys_handle(ctx, event); break;
+        case UI_SCREEN_BT_PRESET: bt_preset_handle(ctx, event); break;
+        case UI_SCREEN_BT_BINDING: bt_binding_handle(ctx, event); break;
+        case UI_SCREEN_BT_TEXT: bt_text_handle(ctx, event); break;
         case UI_SCREEN_NAME: name_handle(ctx, event); break;
         case UI_SCREEN_ICON: icon_handle(ctx, event); break;
         case UI_SCREEN_IR_KEYS: keys_handle(ctx, event); break;
@@ -797,6 +945,9 @@ static void screen_render(ui_ctx_t *ctx, u8g2_t *u8)
         case UI_SCREEN_BT_DEVICE: bt_device_render(ctx, u8); break;
         case UI_SCREEN_BT_CONFIRM: bt_confirm_render(ctx, u8); break;
         case UI_SCREEN_BT_KEYS: bt_keys_render(ctx, u8); break;
+        case UI_SCREEN_BT_PRESET: bt_preset_render(ctx, u8); break;
+        case UI_SCREEN_BT_BINDING: bt_binding_render(ctx, u8); break;
+        case UI_SCREEN_BT_TEXT: name_render(ctx, u8); break;
         case UI_SCREEN_NAME: name_render(ctx, u8); break;
         case UI_SCREEN_ICON: icon_render(ctx, u8); break;
         case UI_SCREEN_IR_KEYS: keys_render(ctx, u8); break;

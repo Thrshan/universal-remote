@@ -1,5 +1,6 @@
 #include "bt_keyboard.h"
 #include "bt_advertising.h"
+#include "bt_output.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +40,7 @@ static EventGroupHandle_t s_events;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static bt_snapshot_t s_snapshot;
 static uint32_t s_desired_session, s_callback_generation;
+static uint32_t s_input_generation;
 static esp_err_t s_remove_result;
 static const char *s_operation = "Bluetooth";
 
@@ -332,21 +334,44 @@ static void post_peer(bool bonded, uint8_t type, const uint8_t *peer)
     s.save_deadline = esp_timer_get_time() + 10000000LL;
     app_post_evt(&event);
 }
+typedef struct { const message_t *message; bool failed; } output_context_t;
+static bool output_active(void *context)
+{
+    const message_t *msg = ((output_context_t *)context)->message;
+    portENTER_CRITICAL(&s_lock);
+    bool active = s_desired_session == msg->session && s_input_generation == msg->generation;
+    portEXIT_CRITICAL(&s_lock);
+    return active && s.connected && s.encrypted && s.saved && s.subscribed;
+}
+static bool output_send(void *context, const bt_key_report_t *report)
+{
+    bool sent = esp_hidd_dev_input_set(s.hid, 0, report->report_id, (uint8_t *)report->data, report->length) == ESP_OK;
+    if (!sent) ((output_context_t *)context)->failed = true;
+    return sent;
+}
+static void output_pause(void *context, unsigned milliseconds)
+{ vTaskDelay(pdMS_TO_TICKS(milliseconds)); }
 static void tap(const message_t *msg)
 {
     app_evt_t result = {.type = APP_EVT_BT_TX_FAIL, .request_id = msg->request};
-    bt_key_report_t report;
-    if (desired_session() == s.session && s.connected && s.encrypted && s.saved
-        && bt_keymap_report(msg->key, msg->flag, &report)) {
+    remote_t remote;
+    output_context_t context = {.message = msg};
+    if (output_active(&context) && app_remote_get(s.profile_index, &remote)) {
+        bt_output_t output = {.context = &context, .active = output_active,
+            .send = output_send, .pause = output_pause};
         // ESP-IDF advertises HID remote-wake support. An explicit user press
         // may wake a suspended host; periodic/background input is never sent.
-        esp_err_t err = esp_hidd_dev_input_set(s.hid, 0, report.report_id, report.data, report.length);
-        vTaskDelay(pdMS_TO_TICKS(40));
-        memset(report.data, 0, sizeof(report.data));
-        esp_err_t released = esp_hidd_dev_input_set(s.hid, 0, report.report_id, report.data, report.length);
-        if (err == ESP_OK && released == ESP_OK) result.type = APP_EVT_BT_TX_DONE;
-        else if (err == ESP_OK && released != ESP_OK) {
-            // Never leave a modifier held after a failed release.
+        bool sent = false;
+        if (remote.bt.preset == BT_PRESET_TEXT && !msg->flag) {
+            char text[BT_TEXT_MAX + 1];
+            if (app_remote_get_bt_text(s.profile_index, msg->key, text)) sent = bt_output_text(&output, text);
+        } else {
+            bt_key_report_t report;
+            if (bt_profile_report(&remote, msg->key, msg->flag, &report)) sent = bt_output_tap(&output, &report);
+        }
+        if (sent) result.type = APP_EVT_BT_TX_DONE;
+        else if (context.failed && desired_session() == s.session) {
+            // Never leave a key or modifier held after a failed release.
             stop_runtime();
             esp_err_t restarted = start_runtime();
             if (restarted != ESP_OK) fail(restarted);
@@ -550,10 +575,16 @@ bool bt_keyboard_tap(uint32_t session, uint32_t request, unsigned key, bool long
     if (snapshot.session != session || (snapshot.state != BT_CONNECTED && snapshot.state != BT_SUSPENDED)
         || desired_session() != session) return false;
     message_t msg = {.type = MSG_TAP, .session = session, .request = request, .key = key, .flag = long_hold};
+    portENTER_CRITICAL(&s_lock);
+    msg.generation = s_input_generation;
+    portEXIT_CRITICAL(&s_lock);
     return enqueue(&msg);
 }
 void bt_keyboard_release(uint32_t session)
 {
+    portENTER_CRITICAL(&s_lock);
+    ++s_input_generation;
+    portEXIT_CRITICAL(&s_lock);
     message_t msg = {.type = MSG_RELEASE, .session = session};
     (void)enqueue(&msg);
 }

@@ -3,6 +3,7 @@
 #include "oled_port.h"
 #include "host_support.h"
 #include "bt_advertising.h"
+#include "bt_output.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -91,6 +92,199 @@ static void snapshot(ui_ctx_t *ctx, const char *name)
 }
 static uint8_t dummy(u8x8_t *u8, uint8_t message, uint8_t argument, void *pointer)
 { (void)u8; (void)message; (void)argument; (void)pointer; return 1; }
+
+static void add_bt(ui_ctx_t *ctx, const char *name, unsigned preset)
+{
+    ui_nav_home(ctx);
+    ctx->home_sel = app_remote_count();
+    key(ctx, REMOTE_KEY_OK); key(ctx, REMOTE_KEY_DOWN); key(ctx, REMOTE_KEY_OK); key(ctx, REMOTE_KEY_OK);
+    snprintf(ctx->draft.name, sizeof(ctx->draft.name), "%s", name);
+    ctx->keyboard_sel = 29;
+    key(ctx, REMOTE_KEY_OK); key(ctx, REMOTE_KEY_OK);
+    ctx->bt_preset_sel = preset;
+    key(ctx, REMOTE_KEY_OK);
+}
+
+typedef struct { unsigned sends, fail_on, cancel_on; bool active; bt_key_report_t reports[8]; } output_probe_t;
+static bool probe_active(void *context) { return ((output_probe_t *)context)->active; }
+static bool probe_send(void *context, const bt_key_report_t *report)
+{
+    output_probe_t *probe = context;
+    if (probe->sends < 8) probe->reports[probe->sends] = *report;
+    return ++probe->sends != probe->fail_on;
+}
+static void probe_pause(void *context, unsigned milliseconds)
+{
+    output_probe_t *probe = context;
+    if (probe->sends == probe->cancel_on) probe->active = false;
+}
+
+static int bluetooth_preset_checks(ui_ctx_t *ctx)
+{
+    remote_t remote;
+    bt_key_report_t report;
+    for (unsigned i = 0; i < bt_keycode_count(); ++i) {
+        bt_binding_t binding = {.keycode = bt_keycode_at(i)};
+        CHECK(bt_binding_valid(binding));
+        CHECK(bt_binding_report(binding, &report) == (i != 0));
+    }
+    for (unsigned ch = 32; ch <= 126; ++ch) CHECK(bt_text_report(ch, &report));
+    CHECK(bt_text_report('\t', &report) && report.data[2] == 0x2B);
+    CHECK(bt_text_report('\n', &report) && report.data[2] == 0x28);
+    CHECK(!bt_text_report((char)0xC3, &report));
+    CHECK(!bt_text_report(0, &report));
+    CHECK(!bt_binding_valid((bt_binding_t){.keycode = BT_KEY_MUTE, .modifiers = 1}));
+    output_probe_t probe = {.active = true};
+    bt_output_t output = {.context = &probe, .active = probe_active, .send = probe_send, .pause = probe_pause};
+    CHECK(bt_output_text(&output, "aA!"));
+    CHECK(probe.sends == 6 && probe.reports[0].data[2] == 4 && probe.reports[2].data[0] == 2
+        && probe.reports[4].data[2] == 0x1E);
+    for (unsigned i = 1; i < probe.sends; i += 2)
+        for (unsigned j = 0; j < 8; ++j) CHECK(probe.reports[i].data[j] == 0);
+    for (unsigned fail = 1; fail <= 2; ++fail) {
+        probe = (output_probe_t){.active = true, .fail_on = fail};
+        CHECK(!bt_output_text(&output, "abc") && probe.sends == 2 && probe.reports[1].data[2] == 0);
+    }
+    probe = (output_probe_t){.active = true, .cancel_on = 1};
+    CHECK(!bt_output_text(&output, "abc") && probe.sends == 2 && probe.reports[1].data[2] == 0);
+    probe = (output_probe_t){.active = false};
+    CHECK(!bt_output_text(&output, "a") && probe.sends == 0);
+    probe.active = true;
+    CHECK(!bt_output_text(&output, "a\x01") && probe.sends == 0);
+
+    add_bt(ctx, "Media", BT_PRESET_MEDIA);
+    unsigned media_index = ctx->active_remote;
+    CHECK(current(ctx) == UI_SCREEN_BT_DEVICE);
+    CHECK(app_remote_get(media_index, &remote) && remote.bt.preset == BT_PRESET_MEDIA && remote_assigned_count(&remote) == 17);
+    CHECK(bt_profile_report(&remote, REMOTE_KEY_VOL_UP, false, &report) && report.report_id == 2 && report.data[0] == 0xE9);
+    CHECK(bt_profile_report(&remote, REMOTE_KEY_VOL_DOWN, false, &report) && report.data[0] == 0xEA);
+    CHECK(bt_profile_report(&remote, REMOTE_KEY_PLAY_PAUSE, false, &report) && report.data[0] == 0xCD);
+    CHECK(bt_profile_report(&remote, REMOTE_KEY_VOL_CLICK, false, &report) && report.data[0] == 0xE2);
+    CHECK(!bt_profile_report(&remote, REMOTE_KEY_POWER, true, &report));
+    ctx->bt_menu_sel = 3; key(ctx, REMOTE_KEY_OK);
+    ctx->bt_key_sel = REMOTE_KEY_VOL_UP; snapshot(ctx, "25-bt-media");
+    key(ctx, REMOTE_KEY_BACK);
+    host_bt_status.state = BT_CONNECTED;
+    key(ctx, REMOTE_KEY_MODE); key(ctx, REMOTE_KEY_PLAY_PAUSE);
+    CHECK(host_bt_report.report_id == 2 && host_bt_report.data[0] == 0xCD && host_bt_report_count == 2);
+    unsigned taps = host_bt_taps;
+    key(ctx, REMOTE_KEY_POWER); release(ctx, REMOTE_KEY_POWER);
+    CHECK(host_bt_taps == taps + 1 && host_bt_report.data[0] == 0x30);
+
+    add_bt(ctx, "Custom", BT_PRESET_CUSTOM);
+    unsigned custom_index = ctx->active_remote;
+    CHECK(current(ctx) == UI_SCREEN_BT_KEYS && app_remote_get(custom_index, &remote) && remote_assigned_count(&remote) == 0);
+    snapshot(ctx, "26-bt-custom-picker");
+    key(ctx, REMOTE_KEY_POWER);
+    CHECK(current(ctx) == UI_SCREEN_BT_BINDING && ctx->bt_key_sel == REMOTE_KEY_POWER);
+    key(ctx, REMOTE_KEY_RIGHT);
+    CHECK(ctx->bt_binding_sel == 1); // Clear/A is the first row of two columns.
+    key(ctx, REMOTE_KEY_DOWN); CHECK(ctx->bt_binding_sel == 3);
+    key(ctx, REMOTE_KEY_LEFT); CHECK(ctx->bt_binding_sel == 2);
+    key(ctx, REMOTE_KEY_UP); CHECK(ctx->bt_binding_sel == 0);
+    key(ctx, REMOTE_KEY_RIGHT);
+    key(ctx, REMOTE_KEY_CUSTOM4); key(ctx, REMOTE_KEY_CUSTOM5); key(ctx, REMOTE_KEY_CUSTOM6);
+    CHECK(ctx->bt_modifiers == 7);
+    key(ctx, REMOTE_KEY_CUSTOM4); CHECK(ctx->bt_modifiers == 6);
+    key(ctx, REMOTE_KEY_CUSTOM4); CHECK(ctx->bt_modifiers == 7);
+    snapshot(ctx, "27-bt-custom-modifiers");
+    host_fail_save = 2; key(ctx, REMOTE_KEY_OK);
+    CHECK(current(ctx) == UI_SCREEN_BT_BINDING && app_remote_get(custom_index, &remote) && remote_assigned_count(&remote) == 0);
+    host_fail_save = 0; key(ctx, REMOTE_KEY_OK);
+    CHECK(current(ctx) == UI_SCREEN_BT_KEYS && app_remote_get(custom_index, &remote) && remote_assigned_count(&remote) == 1);
+    CHECK(bt_profile_report(&remote, REMOTE_KEY_POWER, false, &report) && report.data[0] == 7 && report.data[2] == 4);
+    key(ctx, REMOTE_KEY_UP);
+    CHECK(current(ctx) == UI_SCREEN_BT_BINDING && ctx->bt_modifiers == 0);
+    ctx->bt_binding_sel = bt_keycode_count() - 1;
+    ctx->notice[0] = 0;
+    snapshot(ctx, "28-bt-standard-keys");
+    key(ctx, REMOTE_KEY_OK);
+    CHECK(app_remote_get(custom_index, &remote) && bt_profile_report(&remote, REMOTE_KEY_UP, false, &report) && report.data[0] == 0x80);
+    key(ctx, REMOTE_KEY_CUSTOM4); // This physical button is also independently assignable.
+    CHECK(current(ctx) == UI_SCREEN_BT_BINDING && ctx->bt_key_sel == REMOTE_KEY_CUSTOM4);
+    key(ctx, REMOTE_KEY_BACK); CHECK(current(ctx) == UI_SCREEN_BT_KEYS);
+    hold_back(ctx); CHECK(current(ctx) == UI_SCREEN_BT_DEVICE); // A held BACK must exit its own key assignment.
+    host_bt_status.state = BT_CONNECTED;
+    key(ctx, REMOTE_KEY_MODE);
+    taps = host_bt_taps;
+    key(ctx, REMOTE_KEY_POWER); release(ctx, REMOTE_KEY_POWER);
+    CHECK(host_bt_taps == taps + 1 && host_bt_report.data[0] == 7 && host_bt_report.data[2] == 4);
+    key(ctx, REMOTE_KEY_MODE);
+    ctx->bt_menu_sel = 3; key(ctx, REMOTE_KEY_OK); key(ctx, REMOTE_KEY_POWER);
+    CHECK(ctx->bt_binding_sel == 1 && ctx->bt_modifiers == 7);
+    ctx->bt_binding_sel = 0; key(ctx, REMOTE_KEY_OK);
+    CHECK(app_remote_get(custom_index, &remote) && !bt_profile_key_assigned(&remote, REMOTE_KEY_POWER));
+
+    add_bt(ctx, "Text", BT_PRESET_TEXT);
+    unsigned text_index = ctx->active_remote;
+    CHECK(current(ctx) == UI_SCREEN_BT_KEYS);
+    snapshot(ctx, "29-bt-text-picker");
+    key(ctx, REMOTE_KEY_HOME);
+    CHECK(current(ctx) == UI_SCREEN_BT_TEXT && ctx->bt_key_sel == REMOTE_KEY_HOME);
+    key(ctx, REMOTE_KEY_OK); // a
+    key(ctx, REMOTE_KEY_CUSTOM2); ctx->keyboard_sel = 1; key(ctx, REMOTE_KEY_OK); // B
+    ctx->keyboard_sel = 26; key(ctx, REMOTE_KEY_OK);
+    key(ctx, REMOTE_KEY_CUSTOM2); ctx->keyboard_sel = 2; key(ctx, REMOTE_KEY_OK); // 2
+    CHECK(strcmp(ctx->bt_text_draft, "aB 2") == 0);
+    key(ctx, REMOTE_KEY_CUSTOM2); CHECK(ctx->keyboard_page == 3);
+    ctx->keyboard_sel = 0; key(ctx, REMOTE_KEY_OK); // [
+    ctx->keyboard_sel = 27; key(ctx, REMOTE_KEY_OK);
+    CHECK(strcmp(ctx->bt_text_draft, "aB 2") == 0);
+    snapshot(ctx, "30-bt-text-editor");
+    ctx->keyboard_sel = 29; host_fail_save = 1; key(ctx, REMOTE_KEY_OK);
+    char text[BT_TEXT_MAX + 1];
+    CHECK(current(ctx) == UI_SCREEN_BT_TEXT && app_remote_get_bt_text(text_index, REMOTE_KEY_HOME, text) && !text[0]);
+    host_fail_save = 0; key(ctx, REMOTE_KEY_OK);
+    CHECK(current(ctx) == UI_SCREEN_BT_KEYS && app_remote_get_bt_text(text_index, REMOTE_KEY_HOME, text) && strcmp(text, "aB 2") == 0);
+    key(ctx, REMOTE_KEY_UP);
+    memset(ctx->bt_text_draft, 'x', BT_TEXT_MAX); ctx->bt_text_draft[BT_TEXT_MAX] = 0;
+    ctx->keyboard_sel = 0; key(ctx, REMOTE_KEY_OK); CHECK(strlen(ctx->bt_text_draft) == BT_TEXT_MAX);
+    snapshot(ctx, "31-bt-text-limit");
+    ctx->keyboard_sel = 29; key(ctx, REMOTE_KEY_OK);
+    CHECK(!app_remote_get_bt_text(text_index, REMOTE_KEY_MODE, text));
+    CHECK(app_remote_set_bt_text(text_index, REMOTE_KEY_MODE, "blocked") == ESP_ERR_INVALID_ARG);
+    CHECK(app_remote_set_bt_text(text_index, REMOTE_KEY_HOME, "bad\x01") == ESP_ERR_INVALID_ARG);
+    key(ctx, REMOTE_KEY_HOME);
+    strcpy(ctx->bt_text_draft, "cancel"); key(ctx, REMOTE_KEY_BACK);
+    CHECK(app_remote_get_bt_text(text_index, REMOTE_KEY_HOME, text) && strcmp(text, "aB 2") == 0);
+    key(ctx, REMOTE_KEY_MODE); CHECK(current(ctx) == UI_SCREEN_BT_DEVICE);
+    host_bt_status.state = BT_CONNECTED;
+    key(ctx, REMOTE_KEY_MODE); key(ctx, REMOTE_KEY_HOME);
+    CHECK(host_bt_report_count == 8 && host_bt_reports[0].data[2] == 4 && host_bt_reports[2].data[0] == 2
+        && host_bt_reports[2].data[2] == 5 && host_bt_reports[4].data[2] == 0x2C && host_bt_reports[6].data[2] == 0x1F);
+    for (unsigned i = 1; i < host_bt_report_count; i += 2)
+        for (unsigned j = 0; j < 8; ++j) CHECK(host_bt_reports[i].data[j] == 0);
+    taps = host_bt_taps;
+    ui_event_t repeat = {.type = UI_EV_UP, .src = UI_SRC_KEYPAD, .value = REMOTE_KEY_UP, .repeat = true};
+    ui_nav_dispatch(ctx, &repeat); CHECK(host_bt_taps == taps);
+    key(ctx, REMOTE_KEY_UP); CHECK(host_bt_report_count == BT_TEXT_MAX * 2);
+    key(ctx, REMOTE_KEY_MODE);
+    ui_nav_home(ctx); app_state_init();
+    CHECK(app_remote_get(custom_index, &remote) && remote.bt.preset == BT_PRESET_CUSTOM && remote_assigned_count(&remote) == 1);
+    CHECK(app_remote_get(text_index, &remote) && remote.bt.preset == BT_PRESET_TEXT && remote_assigned_count(&remote) == 2);
+    CHECK(app_remote_get_bt_text(text_index, REMOTE_KEY_HOME, text) && strcmp(text, "aB 2") == 0);
+    CHECK(app_remote_set_bt_text(text_index, REMOTE_KEY_UP, "") == ESP_OK);
+    CHECK(app_remote_get(text_index, &remote) && remote_assigned_count(&remote) == 1);
+    host_fail_save = 2;
+    CHECK(app_remote_remove(media_index) != ESP_OK);
+    CHECK(app_remote_get_bt_text(text_index, REMOTE_KEY_HOME, text) && strcmp(text, "aB 2") == 0);
+    host_fail_save = 0;
+    CHECK(app_remote_remove(media_index) == ESP_OK);
+    CHECK(app_remote_get_bt_text(text_index - 1, REMOTE_KEY_HOME, text) && strcmp(text, "aB 2") == 0);
+    app_state_init();
+    CHECK(app_remote_get_bt_text(text_index - 1, REMOTE_KEY_HOME, text) && strcmp(text, "aB 2") == 0);
+
+    host_clear_storage();
+    remote = (remote_t){.name = "Old Fire TV", .transport = REMOTE_BT, .assigned = bt_keymap_mask()};
+    remote.bt.bonded = 1; remote.bt.peer[0] = 0xAA;
+    host_v1_storage(&remote); app_state_init();
+    CHECK(app_remote_get(0, &remote) && remote.bt.preset == BT_PRESET_FIRE_TV && remote.bt.bonded && remote.bt.peer[0] == 0xAA);
+    CHECK(remote_assigned_count(&remote) == 12 && bt_profile_report(&remote, REMOTE_KEY_POWER, true, &report));
+    CHECK(app_remote_update(0, &remote) == ESP_OK);
+    app_state_init();
+    CHECK(app_remote_get(0, &remote) && remote.bt.preset == BT_PRESET_FIRE_TV && remote.bt.bonded);
+    return 0;
+}
 
 int main(void)
 {
@@ -392,6 +586,19 @@ int main(void)
         key(&ctx, 7);
         ctx.icon_sel = transport == 1 ? 2 : 5;
         key(&ctx, 7);
+        if (transport == REMOTE_BT) {
+            CHECK(current(&ctx) == UI_SCREEN_BT_PRESET && app_remote_count() == 1 && host_bt_opens == 0);
+            ctx.notice[0] = 0;
+            snapshot(&ctx, "24-bt-presets");
+            key(&ctx, REMOTE_KEY_BACK);
+            CHECK(current(&ctx) == UI_SCREEN_ICON && ctx.icon_sel == 2);
+            key(&ctx, REMOTE_KEY_OK);
+            host_fail_save = 1;
+            key(&ctx, REMOTE_KEY_OK);
+            CHECK(current(&ctx) == UI_SCREEN_BT_PRESET && app_remote_count() == 1 && host_bt_opens == 0);
+            host_fail_save = 0;
+            key(&ctx, REMOTE_KEY_OK);
+        }
         CHECK(current(&ctx) == (transport == REMOTE_BT ? UI_SCREEN_BT_DEVICE : UI_SCREEN_CONSTRUCTION));
         snapshot(&ctx, transport == 1 ? "15-bluetooth" : "16-wifi");
         if (transport == REMOTE_BT) {
@@ -538,6 +745,7 @@ int main(void)
         CHECK(ctx.draft.keys[k].addr == 0 && ctx.draft.keys[k].cmd == 0);
     key(&ctx, REMOTE_KEY_HOME);
     CHECK(app_remote_count() == 3);
+    CHECK(bluetooth_preset_checks(&ctx) == 0);
     printf("PASS: %u behavior checks; portrait screen snapshots saved in build_host.\n", checks);
     return 0;
 }

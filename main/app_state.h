@@ -10,6 +10,7 @@
 #define REMOTE_NAME_MAX 12
 #define REMOTE_ICON_COUNT 24
 #define MAX_REMOTES 16
+#define BT_TEXT_MAX 64
 
 // Values are the physical key numbers in the PCB photograph.
 typedef enum {
@@ -24,6 +25,8 @@ typedef enum {
 
 typedef enum { REMOTE_IR = 0, REMOTE_BT, REMOTE_WIFI } remote_transport_t;
 typedef enum { BT_REMOTE_KEYBOARD = 0, BT_REMOTE_MOUSE, BT_REMOTE_CONTROLLER } bt_remote_kind_t;
+typedef enum { BT_PRESET_FIRE_TV = 0, BT_PRESET_MEDIA, BT_PRESET_TEXT, BT_PRESET_CUSTOM } bt_preset_t;
+typedef struct { uint8_t keycode; uint8_t modifiers; } bt_binding_t;
 typedef struct { uint16_t addr; uint16_t cmd; } ir_nec_code_t;
 typedef struct {
     char name[REMOTE_NAME_MAX + 1];
@@ -39,6 +42,8 @@ typedef struct {
             uint8_t addr_type;
             uint8_t peer[6];
             uint8_t local_addr[6]; // Persistent static-random BLE identity for this profile.
+            uint8_t preset; // Zero keeps existing profiles on the Fire TV preset.
+            bt_binding_t bindings[REMOTE_KEY_COUNT];
         } bt;
     };
 } remote_t;
@@ -72,6 +77,7 @@ typedef struct {
     QueueHandle_t evt_q;
     SemaphoreHandle_t model_mutex;
     remote_t remotes[MAX_REMOTES];
+    char bt_text[MAX_REMOTES][REMOTE_KEY_COUNT][BT_TEXT_MAX + 1];
     uint8_t remote_count;
     esp_err_t storage_error;
 } app_ctx_t;
@@ -92,3 +98,6 @@ esp_err_t app_remote_create(const remote_t *remote, unsigned *index);
 esp_err_t app_remote_update(unsigned index, const remote_t *remote);
 esp_err_t app_remote_remove(unsigned index);
 esp_err_t app_remote_set_code(unsigned index, unsigned key, ir_nec_code_t code);
+esp_err_t app_remote_set_bt_binding(unsigned index, unsigned key, bt_binding_t binding);
+esp_err_t app_remote_set_bt_text(unsigned index, unsigned key, const char *text);
+bool app_remote_get_bt_text(unsigned index, unsigned key, char text[BT_TEXT_MAX + 1]);

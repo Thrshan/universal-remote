@@ -33,15 +33,35 @@ Removal opens a confirmation with Cancel selected.
 3. **Icon**: choose from 24 predefined appliance and general icons using arrows
    and OK. More icons appear as focus moves between pages.
 
-The remote is written to storage only when its icon is accepted. BACK moves
+4. **BT preset** (Bluetooth keyboards): after choosing the icon, select Fire TV,
+   Media control, Text, or Custom. Fire TV and Media control open the Bluetooth
+   connection menu with their mappings ready. Text and Custom open key assignment.
+
+IR/WiFi remotes are written to storage when their icon is accepted; Bluetooth
+keyboards are saved when their preset is accepted. BACK moves
 to the preceding step; HOME discards the uncommitted draft and returns home.
 Failed saves keep the current step open and report Save failed.
 
-BT keyboards are saved at the same point, then open their connection menu.
-Pairing, reconnecting, unpairing and the fixed Fire TV mapping are described in
+Pairing, reconnecting, unpairing, presets and editable mappings are described in
 [the Bluetooth guide](bluetooth.md). MODE returns from BT Remote mode to its
 menu without disconnecting. BACK from that menu or HOME from its settings
 closes the session and turns Bluetooth off.
+
+For Text or Custom, press the physical key to assign, including BACK or HOME.
+MODE finishes key assignment; holding BACK returns to the Bluetooth menu.
+Custom shows standard keys in two columns: arrows move, OK saves, and BACK
+cancels. CUST BTN 4 toggles Ctrl, CUST BTN 5 toggles Shift, and CUST BTN 6 toggles
+Alt for the assignment being edited. The active modifiers appear above the list.
+Select Clear to remove an assignment. These shortcuts apply inside the key
+picker; all three custom buttons remain available as ordinary remote keys.
+
+Text uses the on-screen keyboard, with lowercase, uppercase, numbers and symbols.
+Any custom button or the ^ cell switches pages. The underscore cell adds a space,
+< deletes, and -> saves. An empty saved string clears the key. Strings retain
+spaces and are limited to 64 characters. BACK cancels unsaved text. In Remote
+mode, a press types the saved string one character at a time on the connected
+host using a US keyboard layout. Holding a key does not repeat the whole string;
+MODE cancels typing and releases keyboard reports.
 
 WiFi remotes still show Under Construction with Exit selected. OK, BACK or HOME
 exits to the home list. No WiFi transport is implemented.
@@ -81,6 +101,9 @@ If saving fails after capture, Retry save retains the captured command on screen
 ## Stored data
 
 Up to 16 remotes are stored in a versioned NVS profile blob with a checksum.
+Version-1 profiles are read without losing IR recordings or Bluetooth pairings;
+subsequent saves use version 2, appending only nonempty text strings to the same
+checksummed snapshot. A full store reports Save failed and keeps the previous data.
 Failed create, edit, delete or key saves restore the in-memory model. An
 unreadable/corrupt store is reported without erasing or overwriting it.
 

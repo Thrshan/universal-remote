@@ -24,6 +24,10 @@ typedef struct ui_ctx {
     unsigned bt_type_sel;
     unsigned bt_menu_sel;
     unsigned bt_key_sel;
+    unsigned bt_preset_sel;
+    unsigned bt_binding_sel;
+    uint8_t bt_modifiers;
+    char bt_text_draft[BT_TEXT_MAX + 1];
     unsigned bt_confirm_action;
     uint32_t bt_session;
     bt_snapshot_t bt_status;
