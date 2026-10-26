@@ -36,6 +36,13 @@ int xQueueReceive(QueueHandle_t queue, void *item, TickType_t timeout)
     return pdTRUE;
 }
 int64_t esp_timer_get_time(void) { return (int64_t)host_time * 1000; }
+void esp_fill_random(void *buffer, size_t length)
+{
+    // Deterministic host-only entropy source; firmware uses ESP-IDF's RNG.
+    static uint8_t sequence = 1;
+    uint8_t *bytes = buffer;
+    for (size_t i = 0; i < length; ++i) bytes[i] = sequence++;
+}
 const char *esp_err_to_name(int error) { (void)error; return "host error"; }
 esp_err_t nvs_flash_init(void) { return ESP_OK; }
 esp_err_t nvs_open(const char *name, unsigned mode, nvs_handle_t *handle)

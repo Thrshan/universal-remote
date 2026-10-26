@@ -23,13 +23,24 @@ typedef enum {
 } remote_key_t;
 
 typedef enum { REMOTE_IR = 0, REMOTE_BT, REMOTE_WIFI } remote_transport_t;
+typedef enum { BT_REMOTE_KEYBOARD = 0, BT_REMOTE_MOUSE, BT_REMOTE_CONTROLLER } bt_remote_kind_t;
 typedef struct { uint16_t addr; uint16_t cmd; } ir_nec_code_t;
 typedef struct {
     char name[REMOTE_NAME_MAX + 1];
     uint8_t transport;
     uint8_t icon;
     uint32_t assigned;
-    ir_nec_code_t keys[REMOTE_KEY_COUNT];
+    // Keep the v1 profile size/layout: BT metadata occupies the unused IR slots.
+    union {
+        ir_nec_code_t keys[REMOTE_KEY_COUNT];
+        struct {
+            uint8_t kind;
+            uint8_t bonded;
+            uint8_t addr_type;
+            uint8_t peer[6];
+            uint8_t local_addr[6]; // Persistent static-random BLE identity for this profile.
+        } bt;
+    };
 } remote_t;
 
 typedef enum {
@@ -46,11 +57,15 @@ typedef struct {
 typedef enum {
     APP_EVT_IR_LEARNED = 1, APP_EVT_IR_LEARN_TIMEOUT, APP_EVT_IR_TX_DONE,
     APP_EVT_IR_TX_FAIL, APP_EVT_IR_LEARN_FAILED, APP_EVT_IR_UNSUPPORTED,
+    APP_EVT_BT_PEER, APP_EVT_BT_TX_DONE, APP_EVT_BT_TX_FAIL,
 } app_evt_type_t;
 typedef struct {
     app_evt_type_t type;
     uint32_t request_id;
-    union { struct { ir_nec_code_t code; } ir; };
+    union {
+        struct { ir_nec_code_t code; } ir;
+        struct { bool bonded; uint8_t addr_type; uint8_t peer[6]; } bt;
+    };
 } app_evt_t;
 typedef struct {
     QueueHandle_t cmd_q;
@@ -68,6 +83,8 @@ bool app_send_cmd(const app_cmd_t *command, TickType_t timeout);
 const char *remote_key_name(unsigned key);
 const char *remote_transport_name(unsigned transport);
 bool remote_key_assignable(unsigned key);
+bool remote_bt_has_identity(const remote_t *remote);
+void remote_bt_reset_identity(remote_t *remote);
 unsigned remote_assigned_count(const remote_t *remote);
 bool app_remote_get(unsigned index, remote_t *remote);
 unsigned app_remote_count(void);

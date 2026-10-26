@@ -1,53 +1,43 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-H21 | ESP32-H4 | ESP32-P4 | ESP32-S2 | ESP32-S3 | Linux |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | --------- | -------- | -------- | -------- | -------- | ----- |
+# Universal Remote
 
-# Hello World Example
+ESP-IDF 5.5.2 firmware for an ESP32-S3 remote with a 21-key contact keypad,
+SH1106 OLED (64x128 portrait), saved NEC IR remotes, and a BLE HID keyboard
+remote with a Fire TV preset.
 
-Starts a FreeRTOS task to print "Hello World".
+- **IR:** create a named remote, choose an icon, learn each button, and replay NEC commands.
+- **Bluetooth keyboard:** create a remote, pair with a host, reconnect to its saved
+  host, inspect the fixed mappings, pair a new host, or unpair.
+- **Bluetooth mouse/controller:** visible in Add Remote, marked On hold.
+- **Wi-Fi:** saved placeholder; transport not implemented.
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+Open a saved remote with **OK**, then press **MODE** to control it. MODE returns
+to its menu. IR also supports pressing MODE directly on its home-screen tile.
+Opening a Bluetooth tile enables Bluetooth in the background; switching between
+its menu and Remote mode keeps the connection alive. BACK from the BT menu,
+or HOME from its settings, exits the remote and turns Bluetooth off.
 
-## How to use example
+See [the UI guide](docs/ui.md), [Bluetooth setup and mappings](docs/bluetooth.md),
+and [keypad wiring](docs/keypad.md).
 
-Follow detailed instructions provided specifically for this example.
+## Build and check
 
-Select the instructions depending on Espressif chip installed on your development board:
+In an activated ESP-IDF 5.5.2 environment:
 
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
-
-
-## Example folder contents
-
-The project **hello_world** contains one source file in C language [hello_world_main.c](main/hello_world_main.c). The file is located in folder [main](main).
-
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
-
-Below is short explanation of remaining files in the project folder.
-
-```
-├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
-├── main
-│   ├── CMakeLists.txt
-│   └── hello_world_main.c
-└── README.md                  This is the file you are currently reading
+```text
+idf.py set-target esp32s3
+idf.py build
+idf.py -p PORT flash monitor
 ```
 
-For more information on structure and contents of ESP-IDF projects, please refer to Section [Build System](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html) of the ESP-IDF Programming Guide.
+The checked-in `sdkconfig.defaults` enables Bluedroid BLE, stored bonds, and the
+larger single-app partition needed for the HID stack. Existing configurations
+must enable these options too. No flash erase is needed for this change; existing
+remote recordings retain their version-1 storage layout.
 
-## Troubleshooting
+Run `tests/host/run.ps1` with Windows GCC for UI, storage, and key-report checks.
+The host Bluetooth substitute verifies UI lifecycle calls; it does not emulate
+the radio or prove compatibility with a physical Fire TV. Pairing, reconnecting,
+and actual key delivery require the hardware checks in the Bluetooth guide.
 
-* Program upload failure
-
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
-
-## Technical support and feedback
-
-Please use the following feedback channels:
-
-* For technical queries, go to the [esp32.com](https://esp32.com/) forum
-* For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
-
-We will get back to you as soon as possible.
+Active firmware sources are listed in `main/CMakeLists.txt`. Older experiments
+such as `hid_ctrl.c`, `app_events.h`, and alternate main files are not compiled.

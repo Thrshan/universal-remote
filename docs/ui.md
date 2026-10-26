@@ -8,18 +8,24 @@ The startup shows UNIVERSAL REMOTE for two seconds, then opens **Browse mode**
 (the name used for Control mode). The home list has saved remotes followed by
 Add remote. An empty device shows only Add remote. UP/DOWN moves the focus.
 
-On a saved remote, MODE selects it and enters **Remote mode**. Its name,
+On a saved remote, OK opens its menu/editor, then MODE enters **Remote mode**.
+IR also allows MODE directly from the home screen. Bluetooth requires opening
+the remote with OK first. Its name,
 connection, assigned-key count, last button and transmission status are shown.
 Every key except MODE controls the appliance; unassigned keys show Unassigned.
-MODE returns to the same home selection.
+MODE returns to the menu it was opened from (or home for the direct IR shortcut).
 
-OK on a saved remote opens its editor: Learn keys (or Setup for BT/WiFi),
-Name, Icon and Remove. MODE has no effect in the editor or setup screens.
+OK on an IR remote opens its editor: Learn keys, Name, Icon and Remove.
+OK on a Bluetooth keyboard opens its connection menu and enables Bluetooth.
+MODE works in the selected remote's menu/editor; wizard and learning screens
+keep their navigation behavior.
 Removal opens a confirmation with Cancel selected.
 
 ## Add a remote
 
 1. **Connect**: IR, BT or WIFI.
+   BT adds Keyboard, Mouse and Controller choices. Only Keyboard can advance;
+   the others show On hold.
 2. **Name**: up to 12 characters. Arrows navigate a five-column keyboard and OK
    enters the selected character. Any custom button cycles abc, ABC and 123.
    The on-screen underscore inserts a space, < deletes, ^ switches keyboard,
@@ -31,9 +37,14 @@ The remote is written to storage only when its icon is accepted. BACK moves
 to the preceding step; HOME discards the uncommitted draft and returns home.
 Failed saves keep the current step open and report Save failed.
 
-BT/WiFi remotes are saved at the same point, then show Under Construction with
-Exit selected. OK, BACK or HOME exits to the home list. Their Remote mode
-reports Not ready; no BT/WiFi transport is implemented.
+BT keyboards are saved at the same point, then open their connection menu.
+Pairing, reconnecting, unpairing and the fixed Fire TV mapping are described in
+[the Bluetooth guide](bluetooth.md). MODE returns from BT Remote mode to its
+menu without disconnecting. BACK from that menu or HOME from its settings
+closes the session and turns Bluetooth off.
+
+WiFi remotes still show Under Construction with Exit selected. OK, BACK or HOME
+exits to the home list. No WiFi transport is implemented.
 
 ## Learn IR keys
 

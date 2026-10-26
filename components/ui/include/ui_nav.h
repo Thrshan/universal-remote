@@ -1,6 +1,7 @@
 #pragma once
 #include "ui_screen.h"
 #include "app_state.h"
+#include "bt_keyboard.h"
 #define UI_STACK_MAX 8
 #define UI_WIDTH 64
 #define UI_HEIGHT 128
@@ -20,17 +21,25 @@ typedef struct ui_ctx {
     unsigned active_remote;
     unsigned menu_sel;
     unsigned type_sel;
+    unsigned bt_type_sel;
+    unsigned bt_menu_sel;
+    unsigned bt_key_sel;
+    unsigned bt_confirm_action;
+    uint32_t bt_session;
+    bt_snapshot_t bt_status;
+    bool bt_power_pending;
+    bool bt_remove_pending;
     unsigned keyboard_sel;
     unsigned keyboard_page;
     unsigned icon_sel;
     bool editing;
     remote_t draft;
-    char notice[13];
+    char notice[20];
     uint32_t notice_until;
     uint32_t sequence;
     unsigned last_key;
     uint32_t tx_request;
-    char tx_status[13];
+    char tx_status[20];
     struct {
         unsigned key;
         uint32_t request;

@@ -14,7 +14,7 @@ for name in fonts:
     extracted.append(fonts_source[start:end])
 (work / "fonts.c").write_text('\n'.join(extracted))
 sources = [
-    'tests/host/typography_preview.c', 'tests/host/host_support.c', 'main/app_state.c',
+    'tests/host/typography_preview.c', 'tests/host/host_support.c', 'tests/host/bt_fake.c', 'main/app_state.c', 'main/bt_keymap.c',
     'components/ui/ui_nav.c', 'components/ui/ui_screens.c', 'components/ui/ui_icons.c',
     'build_host/typography/fonts.c',
 ] + [str(path) for path in (root / 'managed_components/u8g2/csrc').glob('*.c')

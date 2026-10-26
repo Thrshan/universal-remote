@@ -6,11 +6,15 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "bt_keymap.h"
+#include "esp_random.h"
 
 static app_ctx_t s_app;
 static const char *TAG = "app_state";
 #define STORE_MAGIC 0x554E4952u
 #define STORE_VERSION 1
+_Static_assert(sizeof(remote_t) == 104 && offsetof(remote_t, keys) == 20,
+               "Version-1 remote profiles must retain their on-flash layout");
 
 typedef struct {
     uint32_t magic;
@@ -41,11 +45,33 @@ const char *remote_transport_name(unsigned transport)
 }
 bool remote_key_assignable(unsigned key)
 { return key >= 1 && key <= REMOTE_KEY_COUNT && key != REMOTE_KEY_MODE; }
+bool remote_bt_has_identity(const remote_t *remote)
+{
+    const uint8_t *addr = remote->bt.local_addr;
+    if ((addr[0] & 0xC0) != 0xC0) return false;
+    bool all_zero = (addr[0] & 0x3F) == 0, all_one = (addr[0] & 0x3F) == 0x3F;
+    for (unsigned i = 1; i < 6; ++i) {
+        all_zero &= addr[i] == 0;
+        all_one &= addr[i] == 0xFF;
+    }
+    return !all_zero && !all_one;
+}
+void remote_bt_reset_identity(remote_t *remote)
+{
+    uint8_t previous[6];
+    memcpy(previous, remote->bt.local_addr, 6);
+    do {
+        esp_fill_random(remote->bt.local_addr, 6);
+        remote->bt.local_addr[0] |= 0xC0;
+    } while (!remote_bt_has_identity(remote) || memcmp(previous, remote->bt.local_addr, 6) == 0);
+}
 unsigned remote_assigned_count(const remote_t *remote)
 {
     unsigned count = 0;
+    uint32_t assigned = remote->transport == REMOTE_BT && remote->bt.kind == BT_REMOTE_KEYBOARD
+        ? bt_keymap_mask() : remote->assigned;
     for (unsigned key = 1; key <= REMOTE_KEY_COUNT; ++key)
-        if (remote_key_assignable(key) && (remote->assigned & (1u << (key - 1)))) ++count;
+        if (remote_key_assignable(key) && (assigned & (1u << (key - 1)))) ++count;
     return count;
 }
 void app_post_evt(const app_evt_t *event)
@@ -83,7 +109,9 @@ static bool valid_remote(const remote_t *remote)
     const uint32_t allowed = ((1u << REMOTE_KEY_COUNT) - 1u) & ~(1u << (REMOTE_KEY_MODE - 1));
     return remote->name[0] && memchr(remote->name, 0, sizeof(remote->name))
         && remote->transport <= REMOTE_WIFI && remote->icon < REMOTE_ICON_COUNT
-        && !(remote->assigned & ~allowed);
+        && !(remote->assigned & ~allowed)
+        && (remote->transport != REMOTE_BT || (remote->bt.kind <= BT_REMOTE_CONTROLLER
+            && remote->bt.bonded <= 1 && remote->bt.addr_type <= 3));
 }
 static esp_err_t save_remotes(void)
 {

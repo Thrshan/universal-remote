@@ -65,6 +65,8 @@ void ui_nav_dispatch(ui_ctx_t *ctx, const ui_event_t *event)
 {
     ui_screen_t *current = ui_nav_current(ctx);
     if (!current) return;
+    if ((event->type == UI_EV_KEY_RELEASE || event->type == UI_EV_POWER_LONG)
+        && current->id != UI_SCREEN_REMOTE) return;
     bool learning_screen = current->id == UI_SCREEN_IR_KEYS
         || current->id == UI_SCREEN_IR_REPLACE || current->id == UI_SCREEN_IR_WAIT
         || current->id == UI_SCREEN_IR_RESULT;

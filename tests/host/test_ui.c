@@ -2,6 +2,7 @@
 #include "u8g2.h"
 #include "oled_port.h"
 #include "host_support.h"
+#include "bt_advertising.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -37,6 +38,18 @@ static void hold_back(ui_ctx_t *ctx)
     key(ctx, REMOTE_KEY_BACK);
     ui_event_t event = {.type = UI_EV_BACK_LONG, .src = UI_SRC_KEYPAD, .value = REMOTE_KEY_BACK};
     ui_nav_dispatch(ctx, &event);
+}
+static void release(ui_ctx_t *ctx, unsigned number)
+{
+    ui_event_t event = {.type = UI_EV_KEY_RELEASE, .src = UI_SRC_KEYPAD, .value = number};
+    ui_nav_dispatch(ctx, &event);
+}
+static void bt_peer(ui_ctx_t *ctx, bool bonded)
+{
+    app_evt_t event = {.type = APP_EVT_BT_PEER, .request_id = ctx->bt_session};
+    event.bt.bonded = bonded;
+    if (bonded) { event.bt.peer[0] = 0xA1; event.bt.peer[5] = 0xB2; }
+    ui_handle_app_event(ctx, &event);
 }
 static void tick(ui_ctx_t *ctx, unsigned time)
 {
@@ -81,6 +94,42 @@ static uint8_t dummy(u8x8_t *u8, uint8_t message, uint8_t argument, void *pointe
 
 int main(void)
 {
+    bt_keyboard_init();
+    CHECK(bt_configure_advertising(0x03C1) == ESP_OK);
+    CHECK(host_adv_calls == 2 && host_adv_service == 0x1812 && host_adv_appearance == 0x03C1);
+    CHECK(!host_adv_has_name && host_scan_has_name);
+    host_adv_calls = 0; host_adv_fail_on = 1;
+    CHECK(bt_configure_advertising(0x03C1) == ESP_FAIL && host_adv_calls == 1);
+    host_adv_calls = 0; host_adv_fail_on = 2;
+    CHECK(bt_configure_advertising(0x03C1) == ESP_FAIL && host_adv_calls == 2);
+    host_adv_calls = host_adv_fail_on = 0;
+    remote_t identity = {.transport = REMOTE_BT};
+    CHECK(!remote_bt_has_identity(&identity));
+    remote_bt_reset_identity(&identity);
+    CHECK(remote_bt_has_identity(&identity) && (identity.bt.local_addr[0] & 0xC0) == 0xC0);
+    uint8_t previous_identity[6];
+    memcpy(previous_identity, identity.bt.local_addr, 6);
+    remote_bt_reset_identity(&identity);
+    CHECK(remote_bt_has_identity(&identity) && memcmp(previous_identity, identity.bt.local_addr, 6) != 0);
+    memset(identity.bt.local_addr, 0xFF, 6);
+    CHECK(!remote_bt_has_identity(&identity));
+    // The transport metadata overlay must preserve all existing v1 recordings.
+    CHECK(sizeof(remote_t) == 104);
+    CHECK(sizeof(((remote_t *)0)->keys) == 84);
+    bt_key_report_t report;
+    const unsigned mapped[] = {REMOTE_KEY_BACK, REMOTE_KEY_CUSTOM4, REMOTE_KEY_CH_UP,
+        REMOTE_KEY_PLAY_PAUSE, REMOTE_KEY_CH_DOWN, REMOTE_KEY_UP, REMOTE_KEY_DOWN,
+        REMOTE_KEY_LEFT, REMOTE_KEY_RIGHT, REMOTE_KEY_OK, REMOTE_KEY_POWER};
+    const uint8_t usages[] = {0x29,0x65,0x40,0x41,0x42,0x52,0x51,0x50,0x4F,0x28,0x66};
+    for (unsigned i = 0; i < sizeof(mapped) / sizeof(mapped[0]); ++i) {
+        CHECK(bt_keymap_report(mapped[i], false, &report));
+        CHECK(report.report_id == 1 && report.length == 8 && report.data[0] == 0 && report.data[2] == usages[i]);
+    }
+    CHECK(bt_keymap_report(REMOTE_KEY_HOME, false, &report));
+    CHECK(report.report_id == 2 && report.length == 2 && report.data[0] == 0x23 && report.data[1] == 0x02);
+    CHECK(bt_keymap_report(REMOTE_KEY_POWER, true, &report) && report.data[0] == 5 && report.data[2] == 0x4C);
+    CHECK(!bt_keymap_report(REMOTE_KEY_MODE, false, &report));
+    CHECK(!bt_keymap_report(REMOTE_KEY_VOL_UP, false, &report));
     host_clear_storage();
     app_state_init();
     CHECK(app_remote_count() == 0);
@@ -299,6 +348,8 @@ int main(void)
     key(&ctx, 7);
     snapshot(&ctx, "14-editor");
     key(&ctx, 2);
+    CHECK(current(&ctx) == UI_SCREEN_REMOTE); // Open-first flow, with the IR shortcut retained.
+    key(&ctx, 2);
     CHECK(current(&ctx) == UI_SCREEN_EDIT);
 
     // Name/icon editing preserves every existing key binding.
@@ -320,29 +371,120 @@ int main(void)
     CHECK(current(&ctx) == UI_SCREEN_EDIT);
     CHECK(app_remote_get(0, &remote) && remote.icon == 23 && remote_assigned_count(&remote) == 20);
 
-    // BT/WIFI are saved at the icon step, then show their selected Exit action.
+    // Bluetooth adds a role step; deferred roles cannot create dummy devices.
     key(&ctx, 12);
     for (unsigned transport = 1; transport <= 2; ++transport) {
         ctx.home_sel = app_remote_count();
         key(&ctx, 7);
         for (unsigned i = 0; i < transport; ++i) key(&ctx, 9);
         key(&ctx, 7);
-        strcpy(ctx.draft.name, transport == 1 ? "BT Speaker" : "WiFi Light");
+        if (transport == REMOTE_BT) {
+            CHECK(current(&ctx) == UI_SCREEN_BT_TYPE);
+            snapshot(&ctx, "19-bt-type");
+            key(&ctx, 9); key(&ctx, 7);
+            CHECK(current(&ctx) == UI_SCREEN_BT_TYPE && app_remote_count() == 1);
+            key(&ctx, 9); key(&ctx, 7);
+            CHECK(current(&ctx) == UI_SCREEN_BT_TYPE && app_remote_count() == 1);
+            key(&ctx, 5); key(&ctx, 5); key(&ctx, 7);
+        }
+        strcpy(ctx.draft.name, transport == 1 ? "Fire TV" : "WiFi Light");
         ctx.keyboard_sel = 29;
         key(&ctx, 7);
         ctx.icon_sel = transport == 1 ? 2 : 5;
         key(&ctx, 7);
-        CHECK(current(&ctx) == UI_SCREEN_CONSTRUCTION);
+        CHECK(current(&ctx) == (transport == REMOTE_BT ? UI_SCREEN_BT_DEVICE : UI_SCREEN_CONSTRUCTION));
         snapshot(&ctx, transport == 1 ? "15-bluetooth" : "16-wifi");
-        key(&ctx, 2);
-        CHECK(current(&ctx) == UI_SCREEN_CONSTRUCTION);
-        key(&ctx, 7);
+        if (transport == REMOTE_BT) {
+            CHECK(host_bt_opens == 1);
+            tick(&ctx, host_time + 1);
+            CHECK(ctx.bt_status.state == BT_PAIRING);
+            CHECK(app_remote_get(1, &remote) && remote_assigned_count(&remote) == 12);
+            CHECK(remote_bt_has_identity(&remote));
+            uint8_t paired_identity[6];
+            memcpy(paired_identity, remote.bt.local_addr, 6);
+            key(&ctx, 2);
+            CHECK(current(&ctx) == UI_SCREEN_REMOTE);
+            key(&ctx, REMOTE_KEY_UP);
+            CHECK(host_bt_taps == 0 && strcmp(ctx.tx_status, "BT offline") == 0);
+            bt_peer(&ctx, true);
+            CHECK(host_bt_saved && app_remote_get(1, &remote) && remote.bt.bonded && remote.bt.peer[5] == 0xB2);
+            host_bt_status.state = BT_CONNECTED;
+            tick(&ctx, host_time + 1);
+            snapshot(&ctx, "20-bt-remote");
+            for (unsigned k = 1; k <= REMOTE_KEY_COUNT; ++k) {
+                if (k == REMOTE_KEY_MODE || k == REMOTE_KEY_POWER) continue;
+                unsigned taps = host_bt_taps;
+                key(&ctx, k);
+                CHECK(current(&ctx) == UI_SCREEN_REMOTE);
+                CHECK(host_bt_taps == taps + ((bt_keymap_mask() >> (k - 1)) & 1));
+                release(&ctx, k);
+                CHECK(host_bt_taps == taps + ((bt_keymap_mask() >> (k - 1)) & 1));
+            }
+            unsigned taps = host_bt_taps;
+            key(&ctx, REMOTE_KEY_POWER);
+            CHECK(host_bt_taps == taps);
+            release(&ctx, REMOTE_KEY_POWER);
+            CHECK(host_bt_taps == taps + 1 && host_bt_report.data[2] == 0x66);
+            key(&ctx, REMOTE_KEY_POWER);
+            ui_event_t hold = {.type = UI_EV_POWER_LONG, .src = UI_SRC_KEYPAD, .value = REMOTE_KEY_POWER};
+            ui_nav_dispatch(&ctx, &hold);
+            release(&ctx, REMOTE_KEY_POWER);
+            CHECK(host_bt_taps == taps + 2 && host_bt_report.data[0] == 5 && host_bt_report.data[2] == 0x4C);
+            key(&ctx, REMOTE_KEY_POWER); // Switching mode cancels a pending short Power.
+            key(&ctx, 2);
+            release(&ctx, REMOTE_KEY_POWER);
+            CHECK(current(&ctx) == UI_SCREEN_BT_DEVICE && host_bt_taps == taps + 2);
+            CHECK(host_bt_opens == 1 && host_bt_closes == 0);
+            snapshot(&ctx, "21-bt-connected");
+            host_bt_status.state = BT_SUSPENDED;
+            key(&ctx, 2); key(&ctx, REMOTE_KEY_OK);
+            CHECK(host_bt_taps == taps + 3); // Explicit input can wake a suspended HID host.
+            key(&ctx, 2);
+            host_bt_status.state = BT_CONNECTED;
+            ctx.bt_menu_sel = 3; key(&ctx, 7);
+            CHECK(current(&ctx) == UI_SCREEN_BT_KEYS);
+            snapshot(&ctx, "22-bt-map");
+            key(&ctx, 10);
+            ctx.bt_menu_sel = 1; key(&ctx, 7);
+            CHECK(current(&ctx) == UI_SCREEN_BT_CONFIRM && ctx.menu_sel == 0);
+            snapshot(&ctx, "23-bt-confirm");
+            key(&ctx, 7); // Cancel preserves the bond.
+            CHECK(host_bt_forgets == 0);
+            CHECK(app_remote_get(1, &remote) && memcmp(paired_identity, remote.bt.local_addr, 6) == 0);
+            ctx.bt_menu_sel = 2; key(&ctx, 7); key(&ctx, 9); key(&ctx, 7);
+            CHECK(host_bt_forgets == 1 && !host_bt_pair_after);
+            bt_peer(&ctx, false);
+            CHECK(app_remote_get(1, &remote) && !remote.bt.bonded);
+            CHECK(remote_bt_has_identity(&remote) && memcmp(paired_identity, remote.bt.local_addr, 6) != 0);
+            ctx.bt_menu_sel = 1; key(&ctx, 7); key(&ctx, 9); key(&ctx, 7);
+            CHECK(host_bt_forgets == 2 && host_bt_pair_after);
+            bt_peer(&ctx, true);
+            host_fail_save = 1;
+            bt_peer(&ctx, false);
+            CHECK(!host_bt_saved && app_remote_get(1, &remote) && remote.bt.bonded);
+            host_fail_save = 0;
+            key(&ctx, 10);
+            CHECK(host_bt_closes == 1);
+        } else {
+            key(&ctx, 2);
+            CHECK(current(&ctx) == UI_SCREEN_CONSTRUCTION);
+            key(&ctx, 7);
+        }
         CHECK(current(&ctx) == UI_SCREEN_HOME);
     }
     CHECK(app_remote_count() == 3);
     ctx.home_sel = 1;
     snapshot(&ctx, "17-home-list");
+    key(&ctx, 2);
+    CHECK(current(&ctx) == UI_SCREEN_HOME && host_bt_opens == 1); // BT must be opened first.
     key(&ctx, 7);
+    CHECK(current(&ctx) == UI_SCREEN_BT_DEVICE && host_bt_opens == 2);
+    CHECK(host_bt_status.state == BT_RECONNECTING);
+    uint32_t old_session = ctx.bt_session;
+    app_evt_t late_bt = {.type = APP_EVT_BT_PEER, .request_id = old_session - 1};
+    ui_handle_app_event(&ctx, &late_bt);
+    CHECK(app_remote_get(1, &remote) && remote.bt.bonded);
+    ctx.bt_menu_sel = 4; key(&ctx, 7);
     key(&ctx, 9); key(&ctx, 9); key(&ctx, 9); key(&ctx, 7);
     CHECK(current(&ctx) == UI_SCREEN_REMOVE && ctx.menu_sel == 0);
     snapshot(&ctx, "18-remove");
@@ -351,13 +493,51 @@ int main(void)
     key(&ctx, 7); key(&ctx, 9);
     host_fail_save = 1;
     key(&ctx, 7);
+    bt_peer(&ctx, false);
     CHECK(app_remote_count() == 3 && current(&ctx) == UI_SCREEN_REMOVE);
     host_fail_save = 0;
     key(&ctx, 7);
+    bt_peer(&ctx, false);
     CHECK(app_remote_count() == 2 && current(&ctx) == UI_SCREEN_HOME);
+    CHECK(host_bt_closes == 2 && !ctx.bt_session);
     CHECK(app_remote_get(1, &remote) && strcmp(remote.name, "WiFi Light") == 0);
     app_state_init();
     CHECK(app_remote_count() == 2);
+    remote_t race = {.name = "Pair race", .transport = REMOTE_BT};
+    CHECK(app_remote_create(&race, &index) == ESP_OK && index == 2);
+    ctx.home_sel = index;
+    key(&ctx, 7);
+    CHECK(current(&ctx) == UI_SCREEN_BT_DEVICE);
+    ctx.bt_menu_sel = 4; key(&ctx, 7);
+    key(&ctx, 9); key(&ctx, 7);
+    CHECK(current(&ctx) == UI_SCREEN_NAME);
+    bt_peer(&ctx, true); // Pairing completes after the editor captured its draft.
+    strcpy(ctx.draft.name, "Renamed BT");
+    ctx.keyboard_sel = 29; key(&ctx, 7);
+    CHECK(app_remote_get(index, &remote) && remote.bt.bonded && remote.bt.peer[5] == 0xB2);
+    key(&ctx, 9); key(&ctx, 7);
+    CHECK(current(&ctx) == UI_SCREEN_ICON);
+    bt_peer(&ctx, false);
+    ctx.icon_sel = 7; key(&ctx, 7);
+    CHECK(app_remote_get(index, &remote) && !remote.bt.bonded && remote.icon == 7);
+    uint32_t exited_session = ctx.bt_session;
+    unsigned closes = host_bt_closes;
+    key(&ctx, REMOTE_KEY_HOME);
+    CHECK(current(&ctx) == UI_SCREEN_HOME && !ctx.bt_session && host_bt_closes == closes + 1);
+    app_evt_t after_exit = {.type = APP_EVT_BT_PEER, .request_id = exited_session, .bt.bonded = true};
+    ui_handle_app_event(&ctx, &after_exit);
+    CHECK(app_remote_get(index, &remote) && !remote.bt.bonded);
+    app_state_init();
+    CHECK(app_remote_get(index, &remote) && strcmp(remote.name, "Renamed BT") == 0 && !remote.bt.bonded);
+    ctx.home_sel = app_remote_count();
+    key(&ctx, 7); key(&ctx, 9); key(&ctx, 7); key(&ctx, 7);
+    CHECK(current(&ctx) == UI_SCREEN_NAME && ctx.draft.transport == REMOTE_BT && ctx.draft.assigned);
+    key(&ctx, 10); key(&ctx, 10); key(&ctx, 5); key(&ctx, 7);
+    CHECK(current(&ctx) == UI_SCREEN_NAME && ctx.draft.transport == REMOTE_IR && ctx.draft.assigned == 0);
+    for (unsigned k = 0; k < REMOTE_KEY_COUNT; ++k)
+        CHECK(ctx.draft.keys[k].addr == 0 && ctx.draft.keys[k].cmd == 0);
+    key(&ctx, REMOTE_KEY_HOME);
+    CHECK(app_remote_count() == 3);
     printf("PASS: %u behavior checks; portrait screen snapshots saved in build_host.\n", checks);
     return 0;
 }
