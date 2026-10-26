@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "keypad.h"
 #include "ui_events.h"
+#include "app_state.h"
 
 #define KEYPAD_NODE_COUNT              8
 #define KEYPAD_SCAN_SETTLE_US          700
@@ -109,7 +110,9 @@ static ui_event_type_t map_key_to_ui_event(int key)
         case KEYPAD_RIGHT: return UI_EV_RIGHT;
         case KEYPAD_DOWN:  return UI_EV_DOWN;
         case KEYPAD_BACK:  return UI_EV_BACK;
-        default:          return UI_EV_NONE;
+        case REMOTE_KEY_MODE: return UI_EV_MODE;
+        case REMOTE_KEY_HOME: return UI_EV_HOME;
+        default: return remote_key_assignable(key) ? UI_EV_KEY : UI_EV_NONE;
     }
 }
 
@@ -118,6 +121,7 @@ static ui_event_type_t map_key_to_ui_long(int key)
     switch (key) {
         case KEYPAD_OK:   return UI_EV_OK_LONG;
         case KEYPAD_BACK: return UI_EV_BACK_LONG;
+        case REMOTE_KEY_HOME: return UI_EV_HOME_LONG;
         default:         return UI_EV_NONE;
     }
 }
@@ -126,10 +130,12 @@ static bool key_allows_repeat(int key)
 {
     ui_event_type_t type = map_key_to_ui_event(key);
     return type == UI_EV_UP || type == UI_EV_DOWN
-        || type == UI_EV_LEFT || type == UI_EV_RIGHT;
+        || type == UI_EV_LEFT || type == UI_EV_RIGHT
+        || key == REMOTE_KEY_VOL_UP || key == REMOTE_KEY_VOL_DOWN
+        || key == REMOTE_KEY_CH_UP || key == REMOTE_KEY_CH_DOWN;
 }
 
-static void emit_ui(QueueHandle_t ui_q, ui_event_type_t type)
+static void emit_ui(QueueHandle_t ui_q, ui_event_type_t type, int key, bool repeat)
 {
     if (type == UI_EV_NONE) {
         return;
@@ -139,7 +145,8 @@ static void emit_ui(QueueHandle_t ui_q, ui_event_type_t type)
         .type = type,
         .src = UI_SRC_KEYPAD,
         .ts_ms = now_ms(),
-        .value = 0,
+        .value = key,
+        .repeat = repeat,
     };
     if (xQueueSend(ui_q, &event, 0) != pdTRUE) {
         ESP_LOGW(TAG, "UI queue full; dropped event %d", (int)type);
@@ -255,7 +262,7 @@ static void keypad_task(void *arg)
     bool long_sent = false;
 
     keypad_set_all_inputs_pullup();
-    ESP_LOGI(TAG, "eight-node keypad starting: 5=Up 6=Left 7=OK 8=Right 9=Down 10=Back");
+    ESP_LOGI(TAG, "21-key remote: 2=Mode 5/6/7/8/9=D-pad 10=Back 11=Play/Pause 12=Home");
 
     while (1) {
         keypad_scan_result_t current_result;
@@ -269,7 +276,7 @@ static void keypad_task(void *arg)
                 }
                 if (current_key != 0) {
                     ESP_LOGI(TAG, "press event, key = %d", current_key);
-                    emit_ui(ui_q, map_key_to_ui_event(current_key));
+                    emit_ui(ui_q, map_key_to_ui_event(current_key), current_key, false);
                 }
                 last_key = current_key;
                 press_start_ms = t;
@@ -280,12 +287,12 @@ static void keypad_task(void *arg)
             if (current_key != 0) {
                 uint32_t held_ms = t - press_start_ms;
                 if (!long_sent && held_ms >= LONGPRESS_MS) {
-                    emit_ui(ui_q, map_key_to_ui_long(current_key));
+                    emit_ui(ui_q, map_key_to_ui_long(current_key), current_key, false);
                     long_sent = true;
                 }
                 if (key_allows_repeat(current_key) && held_ms >= REPEAT_DELAY_MS
                     && t - last_repeat_ms >= REPEAT_RATE_MS) {
-                    emit_ui(ui_q, map_key_to_ui_event(current_key));
+                    emit_ui(ui_q, map_key_to_ui_event(current_key), current_key, true);
                     last_repeat_ms = t;
                 }
             }

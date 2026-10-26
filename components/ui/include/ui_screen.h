@@ -1,42 +1,18 @@
-// ===================== components/ui/include/ui_screen.h =====================
 #pragma once
-#include <stdint.h>
 #include <stdbool.h>
 #include "ui_events.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-// Forward-declare u8g2 without exposing its header everywhere
 typedef struct u8g2_struct u8g2_t;
-
 typedef enum {
-    UI_SCREEN_HOME = 0,
-    UI_SCREEN_MENU,
-    UI_SCREEN_ITEMS,
-    UI_SCREEN_ADD_TYPE,
-    UI_SCREEN_ADD_EDIT,
-    UI_SCREEN_DIALOG,
-    UI_SCREEN_IR_LEARN,
-    UI_SCREEN_IR_LIST,
-    UI_SCREEN_COUNT,
+    UI_SCREEN_SPLASH = 0, UI_SCREEN_HOME, UI_SCREEN_REMOTE, UI_SCREEN_EDIT,
+    UI_SCREEN_ADD_TYPE, UI_SCREEN_NAME, UI_SCREEN_ICON, UI_SCREEN_IR_KEYS,
+    UI_SCREEN_IR_REPLACE, UI_SCREEN_IR_WAIT, UI_SCREEN_IR_RESULT,
+    UI_SCREEN_REMOVE, UI_SCREEN_CONSTRUCTION, UI_SCREEN_COUNT,
 } ui_screen_id_t;
-
-struct ui_ctx; // forward
-
+struct ui_ctx;
 typedef struct {
     ui_screen_id_t id;
-
     void (*on_enter)(struct ui_ctx *ctx, void *param);
-    void (*on_exit) (struct ui_ctx *ctx);
-    void (*handle)  (struct ui_ctx *ctx, const ui_event_t *ev);
-    void (*render)  (struct ui_ctx *ctx, u8g2_t *u8);
-
-    // Per-screen private state pointer (points to a struct owned by ctx)
-    void *state;
+    void (*on_exit)(struct ui_ctx *ctx);
+    void (*handle)(struct ui_ctx *ctx, const ui_event_t *event);
+    void (*render)(struct ui_ctx *ctx, u8g2_t *display);
 } ui_screen_t;
-
-#ifdef __cplusplus
-}
-#endif

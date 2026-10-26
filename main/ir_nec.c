@@ -2,6 +2,7 @@
 #include "ir_nec.h"
 #include "app_state.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <string.h>
 
 #include "driver/rmt_tx.h"
@@ -151,77 +152,94 @@ static esp_err_t ensure_rx_enabled(void)
     return ESP_OK;
 }
 
+static void post_ir_event(app_evt_type_t type, uint32_t request_id, const ir_nec_code_t *code)
+{
+    app_evt_t event = {.type = type, .request_id = request_id};
+    if (code) event.ir.code = *code;
+    app_post_evt(&event);
+}
+
+static esp_err_t reset_receiver(void)
+{
+    esp_err_t err = rmt_disable(s_rx_chan);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+    xQueueReset(s_rx_done_q);
+    return ensure_rx_enabled();
+}
+
 static void ir_worker_task(void *arg)
 {
     (void)arg;
-    app_ctx_t *g = app_get_ctx();
-
-    rmt_receive_config_t rx_rcfg = {
+    app_ctx_t *app = app_get_ctx();
+    rmt_receive_config_t config = {
         .signal_range_min_ns = 1250,
         .signal_range_max_ns = 12000000,
     };
+    bool learning = false;
+    uint32_t learn_id = 0;
+    int64_t deadline = 0;
 
     for (;;) {
-        app_cmd_t cmd;
-        if (xQueueReceive(g->cmd_q, &cmd, portMAX_DELAY) != pdTRUE) continue;
-
-        if (cmd.type == APP_CMD_IR_LEARN_ONESHOT) {
-            ESP_ERROR_CHECK(rmt_receive(s_rx_chan, s_rx_buf, sizeof(s_rx_buf), &rx_rcfg));
-
-            rx_done_msg_t done;
-            if (xQueueReceive(s_rx_done_q, &done, pdMS_TO_TICKS(cmd.learn.timeout_ms)) == pdTRUE) {
-                ir_nec_code_t code;
-                debug_print_raw_symbols(s_rx_buf, done.num_symbols);
-
-
-                if (nec_try_decode(s_rx_buf, done.num_symbols, &code)) {
-                    app_evt_t e = {.type = APP_EVT_IR_LEARNED};
-                    e.ir.code = code;
-                    app_post_evt(&e);
-                    ESP_LOGI(TAG, "Learned addr=0x%02X cmd=0x%02X", code.addr, code.cmd);
-                } else {
-                    app_evt_t e = {.type = APP_EVT_IR_LEARN_TIMEOUT};
-                    app_post_evt(&e);
-                    ESP_LOGW(TAG, "Decode failed");
+        app_cmd_t command;
+        // Poll during capture so BACK/HOME can cancel immediately.
+        if (xQueueReceive(app->cmd_q, &command, learning ? pdMS_TO_TICKS(20) : portMAX_DELAY) == pdTRUE) {
+            if (command.type == APP_CMD_IR_LEARN_CANCEL) {
+                if (learning && command.request_id == learn_id) {
+                    learning = false;
+                    (void)reset_receiver();
                 }
-            } else {
-                app_evt_t e = {.type = APP_EVT_IR_LEARN_TIMEOUT};
-                app_post_evt(&e);
-                ESP_LOGW(TAG, "Learn timeout");
+            } else if (command.type == APP_CMD_IR_LEARN_ONESHOT) {
+                learning = false;
+                esp_err_t err = reset_receiver();
+                if (err == ESP_OK)
+                    err = rmt_receive(s_rx_chan, s_rx_buf, sizeof(s_rx_buf), &config);
+                if (err == ESP_OK) {
+                    learning = true;
+                    learn_id = command.request_id;
+                    deadline = esp_timer_get_time() + (int64_t)command.learn.timeout_ms * 1000;
+                } else {
+                    post_ir_event(APP_EVT_IR_LEARN_FAILED, command.request_id, NULL);
+                }
+            } else if (command.type == APP_CMD_IR_TX_SEND) {
+                ir_nec_scan_code_t scan = {
+                    .address = command.tx.code.addr,
+                    .command = command.tx.code.cmd,
+                };
+                rmt_transmit_config_t tx_config = {.loop_count = 0};
+                esp_err_t err = rmt_transmit(s_tx_chan, s_nec_encoder, &scan, sizeof(scan), &tx_config);
+                // This API accepts milliseconds, not FreeRTOS ticks.
+                if (err == ESP_OK) err = rmt_tx_wait_all_done(s_tx_chan, 500);
+                if (err != ESP_OK) {
+                    (void)rmt_disable(s_tx_chan);
+                    (void)rmt_enable(s_tx_chan);
+                }
+                post_ir_event(err == ESP_OK ? APP_EVT_IR_TX_DONE : APP_EVT_IR_TX_FAIL,
+                              command.request_id, NULL);
             }
         }
-        else if (cmd.type == APP_CMD_IR_TX_SEND) {
-            ir_nec_scan_code_t scan = {
-                .address = cmd.tx.code.addr,
-                .command = cmd.tx.code.cmd,
-            };
-            rmt_transmit_config_t tx_cfg = {.loop_count = 0};
-
-            // esp_err_t err = rmt_transmit(s_tx_chan, s_nec_encoder, &scan, sizeof(scan), &tx_cfg);
-            // if (err == ESP_OK) err = rmt_tx_wait_all_done(s_tx_chan, pdMS_TO_TICKS(500));
-            esp_err_t err = rmt_transmit(s_tx_chan, s_nec_encoder, &scan, sizeof(scan), &tx_cfg);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "rmt_transmit failed: %s", esp_err_to_name(err));
-                app_evt_t e = {.type = APP_EVT_IR_TX_FAIL};
-                app_post_evt(&e);
-                continue;
+        if (!learning) continue;
+        rx_done_msg_t done;
+        if (xQueueReceive(s_rx_done_q, &done, 0) == pdTRUE) {
+            ir_nec_code_t code;
+            debug_print_raw_symbols(s_rx_buf, done.num_symbols);
+            if (nec_try_decode(s_rx_buf, done.num_symbols, &code)) {
+                learning = false;
+                post_ir_event(APP_EVT_IR_LEARNED, learn_id, &code);
+                ESP_LOGI(TAG, "Learned NEC addr=%04X cmd=%04X", code.addr, code.cmd);
+            } else {
+                // Keep listening after noise/unsupported frames within the original deadline.
+                post_ir_event(APP_EVT_IR_UNSUPPORTED, learn_id, NULL);
+                if (rmt_receive(s_rx_chan, s_rx_buf, sizeof(s_rx_buf), &config) != ESP_OK) {
+                    learning = false;
+                    (void)reset_receiver();
+                    post_ir_event(APP_EVT_IR_LEARN_FAILED, learn_id, NULL);
+                }
             }
-
-            err = rmt_tx_wait_all_done(s_tx_chan, pdMS_TO_TICKS(2000));
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "tx_wait_all_done failed: %s", esp_err_to_name(err));
-                // try to recover
-                (void)rmt_disable(s_tx_chan);
-                (void)rmt_enable(s_tx_chan);
-                app_evt_t e = {.type = APP_EVT_IR_TX_FAIL};
-                app_post_evt(&e);
-                continue;
-            }
-
-            app_evt_t e;
-            if (err == ESP_OK) e.type = APP_EVT_IR_TX_DONE;
-            else e.type = APP_EVT_IR_TX_FAIL;
-            app_post_evt(&e);
+        }
+        if (learning && esp_timer_get_time() >= deadline) {
+            learning = false;
+            (void)reset_receiver();
+            post_ir_event(APP_EVT_IR_LEARN_TIMEOUT, learn_id, NULL);
         }
     }
 }
@@ -229,5 +247,6 @@ static void ir_worker_task(void *arg)
 void ir_start_tasks(void)
 {
     ir_init_once();
-    xTaskCreate(ir_worker_task, "ir_worker", 4096, NULL, 6, NULL);
+    ESP_ERROR_CHECK(xTaskCreate(ir_worker_task, "ir_worker", 4096, NULL, 6, NULL) == pdPASS
+        ? ESP_OK : ESP_ERR_NO_MEM);
 }
