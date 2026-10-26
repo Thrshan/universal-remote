@@ -17,10 +17,14 @@ typedef enum {
     UI_EV_RIGHT,
     UI_EV_OK,
     UI_EV_BACK,
+    UI_EV_MODE,
+    UI_EV_HOME,
+    UI_EV_KEY,         // Every remaining physical key; value is its PCB number.
 
     // Press variants
     UI_EV_OK_LONG,
     UI_EV_BACK_LONG,
+    UI_EV_HOME_LONG,
 
     // System
     UI_EV_TICK,        // periodic (cursor blink / animation)
@@ -40,6 +44,7 @@ typedef struct {
     ui_event_src_t  src;
     uint32_t        ts_ms;     // timestamp (xTaskGetTickCount()*portTICK_PERIOD_MS)
     int32_t         value;     // optional: encoder delta, etc.
+    bool            repeat;    // held-key repeat, never a new learning target
 } ui_event_t;
 
 #ifdef __cplusplus

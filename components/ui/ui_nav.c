@@ -1,112 +1,107 @@
-// ===================== components/ui/ui_nav.c =====================
 #include "ui_nav.h"
-#include "esp_log.h"
-#include "u8g2.h"  // include only here
+#include <string.h>
+#include "u8g2.h"
 
-static const char *TAG = "ui_nav";
-
-// Forward: screen registration function (implemented in ui_screens.c)
 void ui_register_screens(ui_ctx_t *ctx);
 
-static void call_enter(ui_ctx_t *ctx, ui_screen_t *s, void *param) {
-    if (s && s->on_enter) s->on_enter(ctx, param);
-}
-static void call_exit(ui_ctx_t *ctx, ui_screen_t *s) {
-    if (s && s->on_exit) s->on_exit(ctx);
-}
-
-void ui_nav_init(ui_ctx_t *ctx, void *u8g2_ptr) {
-    ctx->u8g2 = u8g2_ptr;
+void ui_nav_init(ui_ctx_t *ctx, void *display)
+{
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->u8g2 = display;
     ctx->top = -1;
+    ctx->back_target_top = -1;
     ctx->dirty = true;
     ui_register_screens(ctx);
 }
-
-ui_screen_t *ui_nav_current(ui_ctx_t *ctx) {
-    if (ctx->top < 0) return NULL;
-    ui_screen_id_t id = ctx->stack[ctx->top].id;
-    return &ctx->screens[id];
-}
-
-bool ui_nav_push(ui_ctx_t *ctx, ui_screen_id_t id, void *param) {
-    if (ctx->top >= UI_STACK_MAX - 1) {
-        ESP_LOGW(TAG, "stack full");
-        return false;
-    }
-    ui_screen_t *cur = ui_nav_current(ctx);
-    // no exit on push; keep underlying screen state as-is
-    ctx->top++;
-    ctx->stack[ctx->top] = (ui_stack_entry_t){ .id = id, .param = param };
-    call_enter(ctx, &ctx->screens[id], param);
-    ctx->dirty = true;
-    return true;
-}
-
-bool ui_nav_pop(ui_ctx_t *ctx) {
-    if (ctx->top <= 0) { // keep at least one screen
-        return false;
-    }
-    ui_screen_t *cur = ui_nav_current(ctx);
-    call_exit(ctx, cur);
-    ctx->top--;
-    ctx->dirty = true;
-    return true;
-}
-
-bool ui_nav_replace(ui_ctx_t *ctx, ui_screen_id_t id, void *param) {
-    if (ctx->top < 0) return ui_nav_push(ctx, id, param);
-    ui_screen_t *cur = ui_nav_current(ctx);
-    call_exit(ctx, cur);
-    ctx->stack[ctx->top] = (ui_stack_entry_t){ .id = id, .param = param };
-    call_enter(ctx, &ctx->screens[id], param);
-    ctx->dirty = true;
-    return true;
-}
-
-void ui_nav_dispatch(ui_ctx_t *ctx, const ui_event_t *ev) {
-    ui_screen_t *cur = ui_nav_current(ctx);
-    if (!cur || !cur->handle) return;
-
-    cur->handle(ctx, ev);
-
-    // Any interaction usually implies redraw
-    if (ev->type != UI_EV_NONE) ctx->dirty = true;
-}
-
-
-
-static void ui_draw_ir_banner(ui_ctx_t *ctx, u8g2_t *u8)
+ui_screen_t *ui_nav_current(ui_ctx_t *ctx)
 {
-    if (!ctx->ir_banner.show) return;
-
-    char line[24];
-    snprintf(line, sizeof(line), "IR %04X %04X",
-             ctx->ir_banner.last_code.addr,
-             ctx->ir_banner.last_code.cmd);
-
-    // bottom banner (128x16)
-    u8g2_SetDrawColor(u8, 1);
-    u8g2_DrawBox(u8, 0, 64-16, 128, 16);
-    u8g2_SetDrawColor(u8, 0);
-    u8g2_SetFont(u8, u8g2_font_6x12_tf);
-    u8g2_DrawStr(u8, 2, 64-4, line);
-    u8g2_SetDrawColor(u8, 1);
+    return ctx->top < 0 ? NULL : &ctx->screens[ctx->stack[ctx->top].id];
 }
-
-void ui_nav_render_if_dirty(ui_ctx_t *ctx) {
+bool ui_nav_push(ui_ctx_t *ctx, ui_screen_id_t id, void *param)
+{
+    if (id >= UI_SCREEN_COUNT || ctx->top >= UI_STACK_MAX - 1) return false;
+    ctx->stack[++ctx->top].id = id;
+    if (ctx->screens[id].on_enter) ctx->screens[id].on_enter(ctx, param);
+    ctx->dirty = true;
+    return true;
+}
+bool ui_nav_pop(ui_ctx_t *ctx)
+{
+    if (ctx->top <= 0) return false;
+    ui_screen_t *current = ui_nav_current(ctx);
+    if (current->on_exit) current->on_exit(ctx);
+    --ctx->top;
+    ctx->notice[0] = 0;
+    ctx->dirty = true;
+    return true;
+}
+bool ui_nav_replace(ui_ctx_t *ctx, ui_screen_id_t id, void *param)
+{
+    if (id >= UI_SCREEN_COUNT) return false;
+    if (ctx->top < 0) return ui_nav_push(ctx, id, param);
+    ui_screen_t *current = ui_nav_current(ctx);
+    if (current->on_exit) current->on_exit(ctx);
+    ctx->stack[ctx->top].id = id;
+    if (ctx->screens[id].on_enter) ctx->screens[id].on_enter(ctx, param);
+    ctx->notice[0] = 0;
+    ctx->dirty = true;
+    return true;
+}
+void ui_nav_home(ui_ctx_t *ctx)
+{
+    while (ctx->top >= 0) {
+        ui_screen_t *current = ui_nav_current(ctx);
+        if (current->on_exit) current->on_exit(ctx);
+        --ctx->top;
+    }
+    ctx->editing = false;
+    memset(&ctx->draft, 0, sizeof(ctx->draft));
+    ctx->notice[0] = 0;
+    unsigned count = app_remote_count();
+    if (ctx->home_sel > count) ctx->home_sel = count;
+    ui_nav_push(ctx, UI_SCREEN_HOME, NULL);
+}
+void ui_nav_dispatch(ui_ctx_t *ctx, const ui_event_t *event)
+{
+    ui_screen_t *current = ui_nav_current(ctx);
+    if (!current) return;
+    bool learning_screen = current->id == UI_SCREEN_IR_KEYS
+        || current->id == UI_SCREEN_IR_REPLACE || current->id == UI_SCREEN_IR_WAIT
+        || current->id == UI_SCREEN_IR_RESULT;
+    if (event->type == UI_EV_BACK && !event->repeat) {
+        ctx->back_target_top = learning_screen ? ctx->top - 1 : -1;
+        // Short BACK selects its binding on the key picker. On IR details it
+        // waits for the hold, so pressing BACK cannot cancel its own recording.
+        if (learning_screen && current->id != UI_SCREEN_IR_KEYS) return;
+    }
+    if (event->type == UI_EV_BACK_LONG && learning_screen && ctx->back_target_top >= 0) {
+        // A hold may have opened the BACK recording screen on its initial
+        // press. Return relative to the original screen, avoiding that detour.
+        int target = ctx->back_target_top;
+        ctx->back_target_top = -1;
+        while (ctx->top > target) ui_nav_pop(ctx);
+        return;
+    }
+    // Remote mode owns HOME/BACK as appliance commands. In the key picker,
+    // short HOME is learnable; a hold always finishes setup.
+    if (current->id != UI_SCREEN_SPLASH && current->id != UI_SCREEN_REMOTE
+        && (event->type == UI_EV_HOME_LONG
+            || (event->type == UI_EV_HOME && current->id != UI_SCREEN_IR_KEYS))) {
+        ui_nav_home(ctx);
+        return;
+    }
+    if (current->handle) current->handle(ctx, event);
+    if (event->type != UI_EV_NONE && event->type != UI_EV_TICK) ctx->dirty = true;
+}
+void ui_nav_render_if_dirty(ui_ctx_t *ctx)
+{
     if (!ctx->dirty) return;
-
-    u8g2_t *u8 = (u8g2_t *)ctx->u8g2;
-    ui_screen_t *cur = ui_nav_current(ctx);
-    if (!cur || !cur->render) return;
-
-    u8g2_FirstPage(u8);
-    do {
-        cur->render(ctx, u8);
-
-        // Just for banner overlay
-        ui_draw_ir_banner(ctx, u8);
-    } while (u8g2_NextPage(u8));
-
+    u8g2_t *display = ctx->u8g2;
+    ui_screen_t *current = ui_nav_current(ctx);
+    if (!current || !current->render) return;
+    u8g2_ClearBuffer(display);
+    u8g2_SetDrawColor(display, 1);
+    current->render(ctx, display);
+    u8g2_SendBuffer(display);
     ctx->dirty = false;
 }
