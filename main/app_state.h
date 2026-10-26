@@ -5,6 +5,7 @@
 #include "freertos/queue.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
+#include "esp_err.h"
 
 typedef struct {
     uint16_t addr;
@@ -66,3 +67,5 @@ app_ctx_t *app_get_ctx(void);
 void app_post_evt(const app_evt_t *e);
 bool app_send_cmd(const app_cmd_t *c, TickType_t to);
 void app_state_init(void);  // ADD THIS LINE
+esp_err_t app_state_load_ir(void);
+esp_err_t app_state_save_ir(void);

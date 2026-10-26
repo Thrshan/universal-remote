@@ -58,6 +58,7 @@ static void ui_poll_app_events(ui_ctx_t *ctx)
                 g->ir_slots[idx].code = e.ir.code;
             }
             xSemaphoreGive(g->model_mutex);
+            (void)app_state_save_ir();
             ctx->ir_banner.show = true;
             ctx->ir_banner.last_code = e.ir.code;
             ctx->ir_banner.until_ms = (uint32_t)(esp_timer_get_time() / 1000ULL) + 2000; // show 2s
