@@ -117,9 +117,11 @@ static bool custom_key(unsigned key)
 static bool open_bt(ui_ctx_t *ctx, const remote_t *remote)
 {
     remote_t configured = *remote;
-    // Preserve an existing legacy/public-address bond until explicit unpair.
-    if (!configured.bt.bonded && !remote_bt_has_identity(&configured)) {
-        remote_bt_reset_identity(&configured);
+    // Pairing state never changes a profile's BLE identity. Move unpaired
+    // profiles to isolated key storage; existing bonds keep their legacy store
+    // until explicit Unpair/Pair new, so working pairings are preserved.
+    if (!configured.bt.bonded && configured.bt.bond_store == BT_BOND_STORE_LEGACY) {
+        configured.bt.bond_store = BT_BOND_STORE_PROFILE;
         if (app_remote_update(ctx->active_remote, &configured) != ESP_OK) {
             notice(ctx, "Save failed"); return false;
         }
@@ -331,7 +333,8 @@ static void bt_type_handle(ui_ctx_t *ctx, const ui_event_t *event)
     if (ctx->bt_type_sel) { notice(ctx, "On hold"); return; }
     memset(&ctx->draft.bt, 0, sizeof(ctx->draft.bt));
     ctx->draft.bt.kind = BT_REMOTE_KEYBOARD;
-    remote_bt_reset_identity(&ctx->draft);
+    remote_bt_ensure_identity(&ctx->draft);
+    ctx->draft.bt.bond_store = BT_BOND_STORE_PROFILE;
     ctx->draft.assigned = bt_keymap_mask();
     ui_nav_push(ctx, UI_SCREEN_NAME, NULL);
 }
@@ -387,7 +390,7 @@ static void bt_device_render(ui_ctx_t *ctx, u8g2_t *u8)
     for (unsigned i = first; i < first + 3; ++i)
         row(u8, 50 + (i - first) * 18, items[i], ctx->bt_menu_sel == i);
     footer(ctx, u8, ctx->bt_status.state == BT_PAIRING && ctx->bt_status.error != ESP_OK
-        ? "Retry on host" : "MODE:use", "BACK:BT off");
+        ? "Forget on host" : ctx->bt_status.state == BT_UNPAIRED ? "Forget on host" : "MODE:use", "BACK:BT off");
 }
 static void bt_confirm_handle(ui_ctx_t *ctx, const ui_event_t *event)
 {
@@ -405,8 +408,8 @@ static void bt_confirm_render(ui_ctx_t *ctx, u8g2_t *u8)
     u8g2_SetFont(u8, u8g2_font_5x8_tf);
     center(u8, 33, "Forget saved");
     center(u8, 44, "connection?");
-    center(u8, 59, "Other saved");
-    center(u8, 70, "remotes kept");
+    center(u8, 59, "Also forget");
+    center(u8, 70, "on host");
     row(u8, 77, "Cancel", ctx->menu_sel == 0);
     row(u8, 94, "Confirm", ctx->menu_sel == 1);
     footer(ctx, u8, "OK:select", "BACK:cancel");
@@ -968,7 +971,7 @@ void ui_handle_app_event(ui_ctx_t *ctx, const app_evt_t *event)
         remote.bt.bonded = event->bt.bonded;
         remote.bt.addr_type = event->bt.addr_type;
         memcpy(remote.bt.peer, event->bt.peer, 6);
-        if (!event->bt.bonded) remote_bt_reset_identity(&remote);
+        if (!event->bt.bonded) remote.bt.bond_store = BT_BOND_STORE_PROFILE;
         bool saved = app_remote_update(ctx->active_remote, &remote) == ESP_OK;
         bt_keyboard_peer_saved(ctx->bt_session, saved, &remote);
         if (!saved) { ctx->bt_remove_pending = false; notice(ctx, "Save failed"); }

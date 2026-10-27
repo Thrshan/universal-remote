@@ -36,7 +36,9 @@ Use UP/DOWN and OK. Five entries scroll through the three visible rows:
 - **Reconnect:** reopen the saved host connection, or restart discovery after an
   error/timeout. An already connected session stays connected.
 - **Pair new:** confirm forgetting this profile's previous host, then open a new
-  two-minute pairing window. Select the remote from the new host's pairing UI.
+  two-minute pairing window with the same accessory identity. If pairing again
+  to the same host, remove its saved accessory there first; the remote cannot
+  delete the host's copy of its bond.
 - **Unpair:** confirm forgetting this profile's peer and stop Bluetooth. Reconnect
   or Pair new can then begin fresh pairing. If the host retains a stale pairing,
   forget the accessory on the host as well before retrying.
@@ -56,16 +58,42 @@ The peripheral advertises for a host to connect; it does not scan a list of TVs.
 On BT error, the menu shows the failed startup step and the numeric error code;
 the serial log records the same step and the ESP-IDF error name.
 
-Each profile stores its host identity separately. ESP-IDF stores encryption keys
-in NVS. Forgetting a profile preserves a shared host bond if another saved profile
-still uses it. Unrelated remotes and their recordings remain intact.
-New keyboard profiles also store their own static-random BLE address. That
-address stays fixed across exit, reconnect, and reboot. Explicit Unpair/Pair new
-replaces it only after the new identity is durably saved, so a host can discover
-a fresh accessory instead of reusing a stale HID/security cache. Legacy paired
-profiles retain their public-address identity until explicitly unpaired.
-Failed fresh-pairing attempts keep the pairing window open and show Retry on
-host; no key reports are allowed until a later authentication succeeds.
+Each profile is a separate BLE accessory with its own preferred host, constant
+static-random address and isolated SMP key store. Its address stays fixed across
+exit, reconnect, reboot, rename, Unpair and Pair new. Only creating a different
+profile creates a different identity. Existing public-address profiles keep that
+public identity too. Unpair removes a bond, not the accessory identity.
+
+The SDK's public `esp_bt_config_file_path_update()` API selects a separate NVS
+namespace before Bluedroid initialization. The namespace is derived from the
+full local address, not the profile name or index. It contains that profile's
+local IRK/ER and peer security keys, so two profiles paired to the same computer
+do not overwrite one another's keys. Profile reordering does not move bonds.
+
+Existing working profiles retain the old shared namespace until explicit
+Unpair/Pair new. During that transition a legacy host bond is retained if another
+legacy profile still references it. The cleared profile is then durably moved
+to its own namespace without changing its MAC. This can require removing the
+old pairing on the host once, since the isolated namespace starts with new keys.
+Unrelated remotes, IR recordings, key mappings and text are preserved.
+Failed fresh-pairing attempts keep the window open and show Forget on host;
+no input reports are allowed until authentication and profile storage succeed.
+
+The HID component retains the host's actual notification subscriptions for each
+profile and canonical bonded peer. They are saved only after authentication and
+durable profile storage, restored before advertising, and cleared on Unpair or
+Pair new. Disabled subscriptions stay disabled. This includes keyboard boot,
+report-mode and consumer descriptors and the battery descriptor; raw GATT
+handles are never stored. A small project-local `esp_hid` source replacement
+adds explicit snapshot APIs and zero-initializes the SDK's report state; see
+`components/esp_hid/README.md` and [Espressif issue 13054](https://github.com/espressif/esp-idf/issues/13054).
+The GATT database layout remains unchanged. Both Bluedroid and the controller
+are deinitialized on exit so another profile starts with fresh link-layer state.
+Older firmware did not retain these subscriptions. If an existing Windows bond
+keeps flickering or stalls at Connecting after this upgrade, use Pair new and
+remove/re-add that accessory in Windows once. The firmware cannot reconstruct
+a subscription the old version never saved; it must not assume notifications
+were enabled. Subsequent reconnects restore the freshly recorded settings.
 
 ## Keyboard presets
 
@@ -147,11 +175,40 @@ on the next visit; keeping only a disabled host led to a privacy-list crash in
 ESP-IDF 5.5.2. Exit disables the controller/radio without using the final-deinit
 API as a routine mode switch. Each session clears the controller whitelist
 before allowing the selected saved peer, or all peers during fresh pairing.
+Startup explicitly disables retained controller address-resolution state before
+configuring the whitelist. A saved IRK peer then uses Device Privacy mode and
+address resolution, accepting either its identity or resolvable private address.
+Fresh pairing and fixed-address peers leave resolution disabled. Each completion
+must arrive before advertising starts; a ten-second startup timeout or privacy
+failure reports BT error instead of opening the saved-host whitelist.
+
+Unpair uses a separate stack-only path: it opens the selected bond store,
+removes the selected peer, waits for removal completion, and requests durable
+profile storage. There is no HID initialization or advertising during this
+transaction. After the save acknowledgment, it stops or restarts in pairing mode
+with the same local address. A missing saved bond reports an error and requires
+explicit Pair new rather than silently pairing to a different appliance.
+
+Security uses headless Just Works bonding with Secure Connections negotiation
+and encryption/identity key distribution. No artificial display, passkey or
+confirmation requirement is imposed. Host capabilities determine whether Secure
+Connections or legacy pairing is negotiated.
+
+The host runner separately compiles the production worker with deterministic
+ESP-IDF/RTOS substitutes. Checks cover privacy ordering/failures, stable identities,
+namespace isolation for the same host, profile rename/reordering, shared legacy
+bonds, pairing/forget transactions, authenticated-peer selection and old profile
+storage migration. Additional checks cover bonded notification persistence,
+restoring before advertising, waiting for authentication, explicit host disable,
+unpair cleanup, independent local/peer identities and storage errors.
+They do not emulate radio traffic. Serial diagnostics report
+local identity, selected namespace and connection state without printing keys.
 
 BT metadata and Custom bindings overlay the unused IR-code area of BT profiles.
 `remote_t` remains 104 bytes with the same offsets. Existing version-1 profiles
-load as Fire TV; new saves use a version-2 snapshot containing those same profile
-records followed by only the assigned text strings. A checksum covers the entire
+load as Fire TV. Version-1 and version-2 records load with the legacy bond-store
+marker, ignoring the previously unused byte. New saves use a version-3 snapshot
+with the same profile records and appended assigned text strings. A checksum covers the entire
 snapshot, including strings. Text, mappings and peer metadata share a single NVS
 save, with RAM rollback on failure. IR and legacy recording migration are retained.
 
@@ -189,3 +246,48 @@ Run the host suite and ESP-IDF build before flashing. On hardware, check:
 9. Create each keyboard preset; verify Media volume/mute/playback, a Custom
    Ctrl/Shift/Alt combination, repeated characters and punctuation in Text,
    cancellation with MODE, and retention of assignments after reboot.
+
+## Android reconnect regression check
+
+First keep any working existing pairing and verify exit/reopen still works.
+Open the paired profile, leave it for an IR or another BT remote, and return.
+Expect `Peer address resolution enabled`, then `Reconnecting`, `Connecting`,
+and `Connected`. Confirm a mapped key reaches the phone/tablet. Repeat after
+Android rotates its private address (wait at least 15 minutes, or toggle host
+Bluetooth), after remote reboot, and with Reconnect from the menu. Also repeat
+with Windows and alternate two saved hosts; neither may take over the other's
+profile. A trace stuck at Reconnecting without a GATT-link log still requires
+checking host initiation and the over-the-air/HCI address-resolution behavior.
+If startup reports Peer privacy or Address resolution error, capture that error
+and the serial log before trying Pair new; do not erase bonds to hide the failure.
+
+## Stable identity and Windows re-pair check
+
+1. Record the profile identity printed on COM7 and pair it in Windows.
+2. Exit/reopen it and confirm automatic encrypted reconnection.
+3. Choose Unpair on the remote. Remove that same accessory in Windows too.
+4. Choose Pair new and pair again. Confirm the COM7 identity is unchanged and
+   Windows recognizes the same address, rather than another same-name accessory.
+5. Reboot the remote and reconnect again; check one mapped key on the host.
+6. Pair another profile to the same Windows computer and alternate the profiles.
+   Each must use a distinct constant address and namespace. Unpairing one must
+   leave the other's encrypted reconnection working.
+
+Old duplicate entries created by earlier firmware are host-side records; stop
+using those old addresses and remove the stale entries on the host. Renaming a
+profile can also leave a cached display name until the host refreshes it; it does
+not change the BLE identity.
+
+COM7 validation on 2026-10-27 (ELF SHA prefix `318b53863`): the old UR agms
+pairing still reproduced the failure after the upgrade. A fresh Windows pairing
+of UR pqr reached Connected. Reopening restored all three HID descriptor
+subscriptions and reached encrypted Connected; the user confirmed three profile
+switch/return cycles without toggling Windows Bluetooth. Pair new and pairing
+again retained UR pqr's `EE:18:FE:D4:82:F0` identity. Another freshly paired
+profile also reconnected in the captured switch sequence. These results do not
+establish compatibility with every Windows adapter/cache state. A subsequent
+hardware restart retained the same profile address and bond, restored all three
+HID descriptor subscriptions, and reached Connected again without pairing.
+The user then confirmed Enter/arrow key delivery in Windows Notepad. Validation
+also passed 910 UI/storage checks, 272 worker checks and 31 CCC storage checks;
+the normal ESP-IDF/GCC build and hash-verified COM7 flash succeeded.

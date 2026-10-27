@@ -12,7 +12,7 @@
 static app_ctx_t s_app;
 static const char *TAG = "app_state";
 #define STORE_MAGIC 0x554E4952u
-#define STORE_VERSION 2
+#define STORE_VERSION 3
 _Static_assert(sizeof(remote_t) == 104 && offsetof(remote_t, keys) == 20,
                "Version-1 remote profiles must retain their on-flash layout");
 
@@ -56,14 +56,13 @@ bool remote_bt_has_identity(const remote_t *remote)
     }
     return !all_zero && !all_one;
 }
-void remote_bt_reset_identity(remote_t *remote)
+void remote_bt_ensure_identity(remote_t *remote)
 {
-    uint8_t previous[6];
-    memcpy(previous, remote->bt.local_addr, 6);
+    if (remote_bt_has_identity(remote)) return;
     do {
         esp_fill_random(remote->bt.local_addr, 6);
         remote->bt.local_addr[0] |= 0xC0;
-    } while (!remote_bt_has_identity(remote) || memcmp(previous, remote->bt.local_addr, 6) == 0);
+    } while (!remote_bt_has_identity(remote));
 }
 unsigned remote_assigned_count(const remote_t *remote)
 {
@@ -109,7 +108,7 @@ static bool valid_remote(const remote_t *remote)
 {
     const uint32_t allowed = ((1u << REMOTE_KEY_COUNT) - 1u) & ~(1u << (REMOTE_KEY_MODE - 1));
     if (remote->transport == REMOTE_BT) {
-        if (remote->bt.preset > BT_PRESET_CUSTOM) return false;
+        if (remote->bt.preset > BT_PRESET_CUSTOM || remote->bt.bond_store > BT_BOND_STORE_PROFILE) return false;
         if (remote->bt.preset == BT_PRESET_CUSTOM)
             for (unsigned i = 0; i < REMOTE_KEY_COUNT; ++i)
                 if (!bt_binding_valid(remote->bt.bindings[i])
@@ -321,7 +320,7 @@ static esp_err_t load_remotes(void)
     nvs_close(handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) { free(blob); return migrate_legacy(); }
     if (err == ESP_OK && (blob->magic != STORE_MAGIC
-        || (blob->version != 1 && blob->version != STORE_VERSION)
+        || (blob->version != 1 && blob->version != 2 && blob->version != STORE_VERSION)
         || (blob->version == 1 && size != sizeof(*blob))
         || blob->count > MAX_REMOTES || blob->checksum != checksum(blob, size)))
         err = ESP_ERR_INVALID_STATE;
@@ -344,6 +343,10 @@ static esp_err_t load_remotes(void)
                     if (!!(blob->remotes[i].assigned & (1u << (key - 1))) != !!s_app.bt_text[i][key - 1][0])
                         err = ESP_ERR_INVALID_ARG;
     }
+    if (err == ESP_OK && blob->version < 3)
+        for (unsigned i = 0; i < blob->count; ++i)
+            if (blob->remotes[i].transport == REMOTE_BT)
+                blob->remotes[i].bt.bond_store = BT_BOND_STORE_LEGACY;
     if (err == ESP_OK) {
         for (unsigned i = 0; i < blob->count; ++i)
             if (!valid_remote(&blob->remotes[i])) { err = ESP_ERR_INVALID_ARG; break; }

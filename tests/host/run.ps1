@@ -11,6 +11,15 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Host compilation failed' }
     & ./build_host/test_ui.exe
     if ($LASTEXITCODE -ne 0) { throw 'Behavior checks failed' }
+    # Exercise the production Bluetooth worker independently of the UI's bt_fake.c.
+    & gcc -std=c11 -O0 -g -Wall -Wextra -Werror -Wno-unused-parameter -Itests/host/bt_runtime/include -Itests/host/include -Icomponents/esp_hid/include -Imain tests/host/bt_runtime/test_bt_runtime.c main/bt_keymap.c main/bt_output.c -o build_host/test_bt_runtime.exe
+    if ($LASTEXITCODE -ne 0) { throw 'Bluetooth worker compilation failed' }
+    & ./build_host/test_bt_runtime.exe
+    if ($LASTEXITCODE -ne 0) { throw 'Bluetooth worker checks failed' }
+    & gcc -std=c11 -O0 -g -Wall -Wextra -Werror -Wno-unused-parameter -Itests/host/bt_runtime/include -Itests/host/include -Icomponents/esp_hid/include -Imain tests/host/bt_runtime/test_ccc_store.c main/bt_ccc_store.c -o build_host/test_ccc_store.exe
+    if ($LASTEXITCODE -ne 0) { throw 'CCC storage compilation failed' }
+    & ./build_host/test_ccc_store.exe
+    if ($LASTEXITCODE -ne 0) { throw 'CCC storage checks failed' }
 } finally {
     Pop-Location
 }

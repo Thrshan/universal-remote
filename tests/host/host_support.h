@@ -7,6 +7,7 @@ void host_clear_storage(void);
 void host_legacy_storage(unsigned count);
 void host_corrupt_storage(void);
 void host_v1_storage(const remote_t *remote);
+void host_version_storage(const remote_t *remote, unsigned version);
 extern bt_snapshot_t host_bt_status;
 extern unsigned host_bt_opens, host_bt_closes, host_bt_taps, host_bt_forgets, host_bt_releases;
 extern bool host_bt_pair_after, host_bt_saved;

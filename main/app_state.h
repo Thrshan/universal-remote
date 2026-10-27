@@ -25,6 +25,8 @@ typedef enum {
 
 typedef enum { REMOTE_IR = 0, REMOTE_BT, REMOTE_WIFI } remote_transport_t;
 typedef enum { BT_REMOTE_KEYBOARD = 0, BT_REMOTE_MOUSE, BT_REMOTE_CONTROLLER } bt_remote_kind_t;
+typedef enum { BT_BOND_STORE_LEGACY = 0, BT_BOND_STORE_PROFILE = 1 } bt_bond_store_t;
+
 typedef enum { BT_PRESET_FIRE_TV = 0, BT_PRESET_MEDIA, BT_PRESET_TEXT, BT_PRESET_CUSTOM } bt_preset_t;
 typedef struct { uint8_t keycode; uint8_t modifiers; } bt_binding_t;
 typedef struct { uint16_t addr; uint16_t cmd; } ir_nec_code_t;
@@ -44,6 +46,7 @@ typedef struct {
             uint8_t local_addr[6]; // Persistent static-random BLE identity for this profile.
             uint8_t preset; // Zero keeps existing profiles on the Fire TV preset.
             bt_binding_t bindings[REMOTE_KEY_COUNT];
+            uint8_t bond_store; // Versioned backend: legacy shared store or per-identity store.
         } bt;
     };
 } remote_t;
@@ -90,7 +93,7 @@ const char *remote_key_name(unsigned key);
 const char *remote_transport_name(unsigned transport);
 bool remote_key_assignable(unsigned key);
 bool remote_bt_has_identity(const remote_t *remote);
-void remote_bt_reset_identity(remote_t *remote);
+void remote_bt_ensure_identity(remote_t *remote);
 unsigned remote_assigned_count(const remote_t *remote);
 bool app_remote_get(unsigned index, remote_t *remote);
 unsigned app_remote_count(void);

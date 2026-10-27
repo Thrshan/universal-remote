@@ -82,16 +82,17 @@ esp_err_t nvs_commit(nvs_handle_t handle)
 void nvs_close(nvs_handle_t handle) { (void)handle; }
 void host_clear_storage(void) { saved_size = staged_size = legacy_size = 0; host_fail_save = 0; }
 void host_corrupt_storage(void) { assert(saved_size); saved[20] ^= 1; }
-void host_v1_storage(const remote_t *remote)
+void host_version_storage(const remote_t *remote, unsigned version)
 {
     struct { uint32_t magic; uint16_t version, count; remote_t remotes[MAX_REMOTES]; uint32_t checksum; } blob = {0};
-    blob.magic = 0x554E4952u; blob.version = 1; blob.count = 1; blob.remotes[0] = *remote;
+    blob.magic = 0x554E4952u; blob.version = version; blob.count = 1; blob.remotes[0] = *remote;
     const uint8_t *bytes = (const uint8_t *)&blob;
     blob.checksum = 2166136261u;
     for (size_t i = 0; i < sizeof(blob) - sizeof(blob.checksum); ++i)
         blob.checksum = (blob.checksum ^ bytes[i]) * 16777619u;
     memcpy(saved, &blob, sizeof(blob)); saved_size = sizeof(blob);
 }
+void host_v1_storage(const remote_t *remote) { host_version_storage(remote, 1); }
 void host_legacy_storage(unsigned count)
 {
     typedef struct { char name[8]; ir_nec_code_t code; } slot_t;

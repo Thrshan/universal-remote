@@ -283,6 +283,14 @@ static int bluetooth_preset_checks(ui_ctx_t *ctx)
     CHECK(app_remote_update(0, &remote) == ESP_OK);
     app_state_init();
     CHECK(app_remote_get(0, &remote) && remote.bt.preset == BT_PRESET_FIRE_TV && remote.bt.bonded);
+    // Version 2 never defined this spare byte; ignore its old contents without losing the bond.
+    remote.bt.bond_store = 0xA5;
+    host_version_storage(&remote, 2); app_state_init();
+    CHECK(app_remote_get(0, &remote) && remote.bt.bond_store == BT_BOND_STORE_LEGACY && remote.bt.bonded);
+    remote.bt.bond_store = BT_BOND_STORE_PROFILE;
+    CHECK(app_remote_update(0, &remote) == ESP_OK);
+    app_state_init();
+    CHECK(app_remote_get(0, &remote) && remote.bt.bond_store == BT_BOND_STORE_PROFILE && remote.bt.bonded);
     return 0;
 }
 
@@ -299,12 +307,12 @@ int main(void)
     host_adv_calls = host_adv_fail_on = 0;
     remote_t identity = {.transport = REMOTE_BT};
     CHECK(!remote_bt_has_identity(&identity));
-    remote_bt_reset_identity(&identity);
+    remote_bt_ensure_identity(&identity);
     CHECK(remote_bt_has_identity(&identity) && (identity.bt.local_addr[0] & 0xC0) == 0xC0);
     uint8_t previous_identity[6];
     memcpy(previous_identity, identity.bt.local_addr, 6);
-    remote_bt_reset_identity(&identity);
-    CHECK(remote_bt_has_identity(&identity) && memcmp(previous_identity, identity.bt.local_addr, 6) != 0);
+    remote_bt_ensure_identity(&identity);
+    CHECK(remote_bt_has_identity(&identity) && memcmp(previous_identity, identity.bt.local_addr, 6) == 0);
     memset(identity.bt.local_addr, 0xFF, 6);
     CHECK(!remote_bt_has_identity(&identity));
     // The transport metadata overlay must preserve all existing v1 recordings.
@@ -661,8 +669,8 @@ int main(void)
             ctx.bt_menu_sel = 2; key(&ctx, 7); key(&ctx, 9); key(&ctx, 7);
             CHECK(host_bt_forgets == 1 && !host_bt_pair_after);
             bt_peer(&ctx, false);
-            CHECK(app_remote_get(1, &remote) && !remote.bt.bonded);
-            CHECK(remote_bt_has_identity(&remote) && memcmp(paired_identity, remote.bt.local_addr, 6) != 0);
+            CHECK(app_remote_get(1, &remote) && !remote.bt.bonded && remote.bt.bond_store == BT_BOND_STORE_PROFILE);
+            CHECK(remote_bt_has_identity(&remote) && memcmp(paired_identity, remote.bt.local_addr, 6) == 0);
             ctx.bt_menu_sel = 1; key(&ctx, 7); key(&ctx, 9); key(&ctx, 7);
             CHECK(host_bt_forgets == 2 && host_bt_pair_after);
             bt_peer(&ctx, true);

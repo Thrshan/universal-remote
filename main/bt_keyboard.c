@@ -1,11 +1,13 @@
 #include "bt_keyboard.h"
 #include "bt_advertising.h"
 #include "bt_output.h"
+#include "bt_ccc_store.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "esp_bt.h"
 #include "esp_bt_main.h"
+#include "esp_bt_device.h"
 #include "esp_gap_ble_api.h"
 #include "esp_gatts_api.h"
 #include "esp_hidd.h"
@@ -22,8 +24,10 @@
 typedef enum {
     MSG_OPEN, MSG_CLOSE, MSG_FORGET, MSG_SAVED, MSG_TAP, MSG_RELEASE,
     MSG_HID_READY, MSG_ADV_DATA, MSG_SCAN_DATA, MSG_WHITELIST, MSG_ADDRESS, MSG_ADV_STARTED,
-    MSG_CONNECTED, MSG_AUTH, MSG_DISCONNECTED, MSG_WRITE, MSG_SUSPEND,
+    MSG_PEER_PRIVACY, MSG_PRIVACY, MSG_CONNECTED, MSG_AUTH, MSG_DISCONNECTED, MSG_WRITE, MSG_SUSPEND,
 } message_type_t;
+typedef enum { PRIVACY_RESETTING, PRIVACY_PREPARING, PRIVACY_ENABLING, PRIVACY_READY } privacy_phase_t;
+
 typedef struct {
     message_type_t type;
     uint32_t session, generation, request;
@@ -52,11 +56,17 @@ static struct {
     esp_hidd_dev_t *hid;
     bool controller_init, controller_on, host_init, host_on;
     bool hid_ready, adv_ready, scan_ready, whitelist_ready, address_ready, advertising;
+    bool privacy_ready, peer_has_irk;
+    privacy_phase_t privacy_phase;
     bool connected, encrypted, subscribed, saved, suspended;
     bool pairing, awaiting_save, forgetting, pair_after;
     uint8_t peer[6];
-    int64_t pair_deadline, connect_deadline, save_deadline;
-    char name[24];
+    uint8_t peer_identity[6];
+    esp_ble_addr_type_t peer_identity_type;
+    int64_t start_deadline, pair_deadline, connect_deadline, save_deadline;
+    char name[24], store_name[16];
+    esp_hidd_ccc_t persisted_ccc;
+    bool ccc_persisted;
 } s;
 
 static uint32_t desired_session(void)
@@ -107,6 +117,10 @@ static void gap_callback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *p
             msg.type = MSG_ADV_STARTED; msg.error = param->adv_start_cmpl.status; break;
         case ESP_GAP_BLE_SET_STATIC_RAND_ADDR_EVT:
             msg.type = MSG_ADDRESS; msg.error = param->set_rand_addr_cmpl.status; break;
+        case ESP_GAP_BLE_SET_PRIVACY_MODE_COMPLETE_EVT:
+            msg.type = MSG_PEER_PRIVACY; msg.error = param->set_privacy_mode_cmpl.status; break;
+        case ESP_GAP_BLE_SET_LOCAL_PRIVACY_COMPLETE_EVT:
+            msg.type = MSG_PRIVACY; msg.error = param->local_privacy_cmpl.status; break;
         case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
             xEventGroupSetBits(s_events, ADV_STOPPED); return;
         case ESP_GAP_BLE_REMOVE_BOND_DEV_COMPLETE_EVT:
@@ -138,6 +152,7 @@ static void gatts_callback(esp_gatts_cb_event_t event, esp_gatt_if_t interface,
         memcpy(msg.peer, param->connect.remote_bda, 6);
         callback_message(msg);
     } else if (event == ESP_GATTS_DISCONNECT_EVT) {
+        ESP_LOGI(TAG, "GATT disconnect reason 0x%02x", param->disconnect.reason);
         xEventGroupSetBits(s_events, LINK_DOWN);
         callback_message((message_t){.type = MSG_DISCONNECTED});
     } else if (event == ESP_GATTS_WRITE_EVT) {
@@ -152,25 +167,73 @@ static void hid_callback(void *arg, esp_event_base_t base, int32_t id, void *dat
         callback_message((message_t){.type = MSG_SUSPEND, .flag = !event->control.control});
     }
 }
-static bool bond_exists(const uint8_t *peer)
+static bool bond_matches(const esp_ble_bond_dev_t *bond, const uint8_t *peer, uint8_t addr_type)
+{
+    const esp_ble_pid_keys_t *pid = &bond->bond_key.pid_key;
+    // Profiles can contain the bond database address or resolved identity.
+    bool database_match = bond->bd_addr_type <= BLE_ADDR_TYPE_RPA_RANDOM
+        && (bond->bd_addr_type & 1) == (addr_type & 1) && memcmp(peer, bond->bd_addr, 6) == 0;
+    bool identity_match = (bond->bond_key.key_mask & ESP_BLE_ID_KEY_MASK)
+        && pid->addr_type <= BLE_ADDR_TYPE_RANDOM && pid->addr_type == (addr_type & 1)
+        && memcmp(peer, pid->static_addr, 6) == 0;
+    return addr_type <= BLE_ADDR_TYPE_RPA_RANDOM && (database_match || identity_match);
+}
+static esp_err_t find_bond(const uint8_t *peer, uint8_t addr_type, esp_ble_bond_dev_t *bond)
 {
     int count = esp_ble_get_bond_device_num();
-    if (count <= 0) return false;
+    if (count < 0) return ESP_FAIL;
+    if (!count) return ESP_ERR_NOT_FOUND;
     esp_ble_bond_dev_t *bonds = calloc(count, sizeof(*bonds));
-    if (!bonds) return false;
-    bool found = false;
-    if (esp_ble_get_bond_device_list(&count, bonds) == ESP_OK)
-        for (int i = 0; i < count; ++i)
-            if (memcmp(peer, bonds[i].bd_addr, 6) == 0) found = true;
+    if (!bonds) return ESP_ERR_NO_MEM;
+    esp_err_t err = esp_ble_get_bond_device_list(&count, bonds);
+    if (err == ESP_OK) {
+        err = ESP_ERR_NOT_FOUND;
+        for (int i = 0; i < count; ++i) {
+            if (bond_matches(&bonds[i], peer, addr_type)) {
+                *bond = bonds[i];
+                err = ESP_OK;
+                break;
+            }
+        }
+    }
     free(bonds);
-    return found;
+    return err;
 }
-static bool bond_used_elsewhere(const uint8_t *peer)
+static esp_err_t bond_identity(const esp_ble_bond_dev_t *bond, uint8_t *identity,
+                               esp_ble_addr_type_t *type, bool *has_irk)
+{
+    static const uint8_t zero_irk[16];
+    const esp_ble_pid_keys_t *pid = &bond->bond_key.pid_key;
+    *has_irk = (bond->bond_key.key_mask & ESP_BLE_ID_KEY_MASK)
+        && memcmp(pid->irk, zero_irk, sizeof(zero_irk)) != 0;
+    *type = *has_irk ? pid->addr_type : (bond->bd_addr_type & 1);
+    memcpy(identity, *has_irk ? pid->static_addr : bond->bd_addr, 6);
+    // A private address is not a stable whitelist entry. Never turn a
+    // malformed identity into unrestricted pairing on reconnect.
+    if (bond->bd_addr_type > BLE_ADDR_TYPE_RPA_RANDOM || *type > BLE_ADDR_TYPE_RANDOM
+        || (*type == BLE_ADDR_TYPE_RANDOM && (identity[0] & 0xC0) != 0xC0))
+        return ESP_ERR_INVALID_STATE;
+    return ESP_OK;
+}
+static bool authenticated_saved_peer(const message_t *msg)
+{
+    esp_ble_bond_dev_t bond;
+    uint8_t identity[6];
+    esp_ble_addr_type_t type;
+    bool has_irk;
+    return find_bond(msg->peer, msg->addr_type, &bond) == ESP_OK
+        && bond_identity(&bond, identity, &type, &has_irk) == ESP_OK
+        && type == s.peer_identity_type && memcmp(identity, s.peer_identity, 6) == 0;
+}
+static bool bond_used_elsewhere(const esp_ble_bond_dev_t *bond)
 {
     remote_t remote;
     for (unsigned i = 0; i < app_remote_count(); ++i)
         if (i != s.profile_index && app_remote_get(i, &remote) && remote.transport == REMOTE_BT
-            && remote.bt.bonded && memcmp(remote.bt.peer, peer, 6) == 0) return true;
+            && remote.bt.bonded && remote.bt.bond_store == s.profile.bt.bond_store
+            && (remote.bt.bond_store == BT_BOND_STORE_LEGACY
+                || memcmp(remote.bt.local_addr, s.profile.bt.local_addr, 6) == 0)
+            && bond_matches(bond, remote.bt.peer, remote.bt.addr_type)) return true;
     return false;
 }
 static void release_reports(void)
@@ -180,48 +243,72 @@ static void release_reports(void)
     (void)esp_hidd_dev_input_set(s.hid, 0, 1, zero, 8);
     (void)esp_hidd_dev_input_set(s.hid, 0, 2, zero, 2);
 }
-static void disconnect_link(void)
+static esp_err_t disconnect_link(void)
 {
-    if (!s.connected) return;
+    if (!s.connected) return ESP_OK;
     release_reports();
     xEventGroupClearBits(s_events, LINK_DOWN);
-    if (esp_ble_gap_disconnect(s.peer) == ESP_OK)
-        (void)xEventGroupWaitBits(s_events, LINK_DOWN, pdTRUE, pdTRUE, pdMS_TO_TICKS(1500));
+    esp_err_t err = esp_ble_gap_disconnect(s.peer);
+    if (err == ESP_OK && !(xEventGroupWaitBits(s_events, LINK_DOWN, pdTRUE, pdTRUE,
+                                               pdMS_TO_TICKS(1500)) & LINK_DOWN)) err = ESP_ERR_TIMEOUT;
     s.connected = s.encrypted = s.subscribed = false;
+    return err;
 }
-static void stop_advertising(void)
+static esp_err_t stop_advertising(void)
 {
-    if (!s.advertising) return;
+    if (!s.advertising) return ESP_OK;
     xEventGroupClearBits(s_events, ADV_STOPPED);
-    if (esp_ble_gap_stop_advertising() == ESP_OK)
-        (void)xEventGroupWaitBits(s_events, ADV_STOPPED, pdTRUE, pdTRUE, pdMS_TO_TICKS(500));
+    esp_err_t err = esp_ble_gap_stop_advertising();
+    if (err == ESP_OK && !(xEventGroupWaitBits(s_events, ADV_STOPPED, pdTRUE, pdTRUE,
+                                               pdMS_TO_TICKS(500)) & ADV_STOPPED)) err = ESP_ERR_TIMEOUT;
     s.advertising = false;
+    return err;
 }
-static void stop_runtime(void)
+static esp_err_t stop_runtime(void)
 {
     if (s.controller_on || s.host_on) status(BT_STOPPING, ESP_OK);
-    stop_advertising();
-    disconnect_link();
-    if (s.hid) {
-        esp_hidd_dev_event_handler_unregister(s.hid, hid_callback, ESP_HIDD_ANY_EVENT);
-        esp_hidd_dev_deinit(s.hid);
-        s.hid = NULL;
-    }
-    if (s.host_on) esp_bluedroid_disable();
-    if (s.host_init) esp_bluedroid_deinit();
-    if (s.controller_on) esp_bt_controller_disable();
-    // Controller deinit is a final, once-only operation. Disable its radio,
-    // retaining controller initialization. Bluedroid must be deinitialized:
-    // IDF 5.5.2 frees privacy-list buffers on disable and does not recreate
-    // them on enable alone (btm_ble_enq_resolving_list_pending can crash).
+    // Invalidate queued callbacks before teardown. Disconnect/stop completion
+    // bits are still signalled directly, so they can safely be awaited here.
     portENTER_CRITICAL(&s_lock);
     s_callback_generation = 0;
     portEXIT_CRITICAL(&s_lock);
-    s.controller_on = s.host_on = s.host_init = false;
+    esp_err_t result = stop_advertising();
+    esp_err_t err = disconnect_link();
+    if (result == ESP_OK) result = err;
+    if (s.hid) {
+        (void)esp_hidd_dev_event_handler_unregister(s.hid, hid_callback, ESP_HIDD_ANY_EVENT);
+        err = esp_hidd_dev_deinit(s.hid);
+        if (err == ESP_OK) s.hid = NULL;
+        if (result == ESP_OK) result = err;
+    }
+    if (s.host_on) {
+        err = esp_bluedroid_disable();
+        if (err == ESP_OK) s.host_on = false;
+        if (result == ESP_OK) result = err;
+    }
+    if (s.host_init && !s.host_on) {
+        err = esp_bluedroid_deinit();
+        if (err == ESP_OK) s.host_init = false;
+        if (result == ESP_OK) result = err;
+    }
+    if (s.controller_on && !s.host_on) {
+        err = esp_bt_controller_disable();
+        if (err == ESP_OK) s.controller_on = false;
+        if (result == ESP_OK) result = err;
+    }
+    if (s.controller_init && !s.controller_on && !s.host_init) {
+        err = esp_bt_controller_deinit();
+        if (err == ESP_OK) s.controller_init = false;
+        if (result == ESP_OK) result = err;
+    }
+    // A different profile is a different local identity. Recreate BOTH layers
+    // so link-layer privacy/address state cannot outlive the selected key store.
     s.hid_ready = s.adv_ready = s.scan_ready = s.whitelist_ready = false;
-    s.address_ready = false;
-    s.pair_deadline = s.connect_deadline = s.save_deadline = 0;
+    s.address_ready = s.privacy_ready = s.peer_has_irk = false;
+    s.privacy_phase = PRIVACY_RESETTING;
+    s.start_deadline = s.pair_deadline = s.connect_deadline = s.save_deadline = 0;
     s.awaiting_save = s.forgetting = false;
+    return result;
 }
 static void fail(esp_err_t error)
 {
@@ -229,9 +316,11 @@ static void fail(esp_err_t error)
     stop_runtime();
     status(BT_ERROR, error);
 }
-static esp_err_t start_runtime(void)
+static esp_err_t start_stack(void)
 {
+    if (s.host_on || s.host_init || s.controller_on || s.hid) return ESP_ERR_INVALID_STATE;
     status(BT_STARTING, ESP_OK);
+    s.start_deadline = esp_timer_get_time() + 10000000LL;
     ++s.generation;
     portENTER_CRITICAL(&s_lock);
     s_callback_generation = s.generation;
@@ -245,11 +334,21 @@ static esp_err_t start_runtime(void)
     }
     if ((err = esp_bt_controller_enable(ESP_BT_MODE_BLE)) != ESP_OK) return err;
     s.controller_on = true;
+
+    // Public ESP-IDF API: one complete SMP database (including local IRK/ER)
+    // per stable local identity. Never key this by the mutable profile index.
+    if (s.profile.bt.bond_store == BT_BOND_STORE_LEGACY)
+        snprintf(s.store_name, sizeof(s.store_name), "bt_config.conf");
+    else if (remote_bt_has_identity(&s.profile)) {
+        const uint8_t *a = s.profile.bt.local_addr;
+        snprintf(s.store_name, sizeof(s.store_name), "ur%02x%02x%02x%02x%02x%02x",
+                 a[0], a[1], a[2], a[3], a[4], a[5]);
+    } else snprintf(s.store_name, sizeof(s.store_name), "ur_public");
+    s_operation = "Bond storage";
+    if ((err = esp_bt_config_file_path_update(s.store_name)) != ESP_OK) return err;
     s_operation = "BT host";
-    if (!s.host_init) {
-        if ((err = esp_bluedroid_init()) != ESP_OK) return err;
-        s.host_init = true;
-    }
+    if ((err = esp_bluedroid_init()) != ESP_OK) return err;
+    s.host_init = true;
     if ((err = esp_bluedroid_enable()) != ESP_OK) return err;
     s.host_on = true;
     s_operation = "Callbacks";
@@ -260,27 +359,51 @@ static esp_err_t start_runtime(void)
         s_operation = "BT identity";
         if ((err = esp_ble_gap_set_rand_addr(s.profile.bt.local_addr)) != ESP_OK) return err;
     }
+    const uint8_t *a = remote_bt_has_identity(&s.profile) ? s.profile.bt.local_addr : esp_bt_dev_get_address();
+    if (a) ESP_LOGI(TAG, "Profile %u, %s, identity %02x:%02x:%02x:%02x:%02x:%02x",
+        s.profile_index, s.store_name, a[0], a[1], a[2], a[3], a[4], a[5]);
 
-    // Headless keyboard: encrypted bonding, without pretending to have a
-    // display/confirmation key or requiring a hard-coded demo passkey.
+    // Headless Just Works with bonding; negotiate Secure Connections when the
+    // host supports it. No fake display/passkey requirement is imposed.
     s_operation = "Security";
-    esp_ble_auth_req_t auth = ESP_LE_AUTH_BOND;
+    esp_ble_auth_req_t auth = ESP_LE_AUTH_REQ_SC_BOND;
     esp_ble_io_cap_t io = ESP_IO_CAP_NONE;
     uint8_t keys = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK, key_size = 16;
     if ((err = esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth, sizeof(auth))) != ESP_OK) return err;
     if ((err = esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &io, sizeof(io))) != ESP_OK) return err;
     if ((err = esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, 1)) != ESP_OK) return err;
     if ((err = esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &keys, 1)) != ESP_OK) return err;
-    if ((err = esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &keys, 1)) != ESP_OK) return err;
-
-    s.pairing = !s.profile.bt.bonded || !bond_exists(s.profile.bt.peer);
+    return esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &keys, 1);
+}
+static esp_err_t start_runtime(void)
+{
+    esp_err_t err = start_stack();
+    if (err != ESP_OK) return err;
+    s_operation = "Saved bond";
+    esp_ble_bond_dev_t bond = {0};
+    if (s.profile.bt.bonded) {
+        err = find_bond(s.profile.bt.peer, s.profile.bt.addr_type, &bond);
+        // Missing/corrupt saved keys require explicit Pair new, not an
+        // unsolicited, unrestricted pairing window on a saved appliance.
+        if (err != ESP_OK) return err;
+    }
+    s.pairing = !s.profile.bt.bonded;
+    s.peer_has_irk = false;
+    if (!s.pairing) {
+        s_operation = "Peer identity";
+        if ((err = bond_identity(&bond, s.peer_identity, &s.peer_identity_type, &s.peer_has_irk)) != ESP_OK)
+            return err;
+        ESP_LOGI(TAG, "Saved peer: identity type %u, IRK %s", (unsigned)s.peer_identity_type,
+                 s.peer_has_irk ? "available" : "absent (fixed address)");
+    }
     s.saved = !s.pairing;
     s.awaiting_save = s.forgetting = s.suspended = false;
-    // A disabled controller can retain filtering state. Clear first, then
-    // asynchronously add only this profile's saved peer before advertising.
-    s.whitelist_ready = false;
-    s_operation = "Clear peers";
-    if ((err = esp_ble_gap_clear_whitelist()) != ESP_OK) return err;
+    s.whitelist_ready = s.privacy_ready = false;
+    s.privacy_phase = PRIVACY_RESETTING;
+    // Reset retained controller policy for pairing as well as reconnecting.
+    // The completion drives whitelist setup, then (if needed) peer privacy.
+    s_operation = "Privacy reset";
+    if ((err = esp_ble_gap_config_local_privacy(false)) != ESP_OK) return err;
     snprintf(s.name, sizeof(s.name), "UR %.12s", s.profile.name);
     s_operation = "Device name";
     if ((err = esp_ble_gap_set_device_name(s.name)) != ESP_OK) return err;
@@ -290,15 +413,15 @@ static esp_err_t start_runtime(void)
     esp_hid_device_config_t config = {
         .vendor_id = 0x303A, .product_id = 0x4001, .version = 0x0100,
         .device_name = s.name, .manufacturer_name = "Universal Remote",
-        .serial_number = "URKeyboard", .report_maps = &map, .report_maps_len = 1,
+        .serial_number = s.store_name, .report_maps = &map, .report_maps_len = 1,
     };
     s_operation = "HID service";
     return esp_hidd_dev_init(&config, ESP_HID_TRANSPORT_BLE, hid_callback, &s.hid);
 }
 static void advertise_if_ready(void)
 {
-    if (!s.hid_ready || !s.adv_ready || !s.scan_ready || !s.whitelist_ready || !s.address_ready
-        || s.connected || s.advertising || s.awaiting_save
+    if (!s.hid_ready || !s.adv_ready || !s.scan_ready || !s.whitelist_ready || !s.address_ready || !s.privacy_ready
+        || s.connected || s.advertising || s.awaiting_save || s.forgetting
         || desired_session() != s.session) return;
     esp_ble_adv_params_t params = {
         .adv_int_min = 0x30, .adv_int_max = 0x50, .adv_type = ADV_TYPE_IND,
@@ -312,17 +435,49 @@ static void advertise_if_ready(void)
     s.advertising = true;
     if (s.pairing && !s.pair_deadline) s.pair_deadline = esp_timer_get_time() + PAIR_WINDOW_MS * 1000LL;
 }
+static const uint8_t *local_identity(void)
+{
+    return remote_bt_has_identity(&s.profile) ? s.profile.bt.local_addr : esp_bt_dev_get_address();
+}
+static esp_err_t restore_subscriptions(void)
+{
+    s.ccc_persisted = false;
+    if (s.pairing) return ESP_OK;
+    esp_hidd_ccc_t ccc;
+    esp_err_t err = bt_ccc_load(local_identity(), s.peer_identity, s.peer_identity_type, &ccc);
+    if (err == ESP_ERR_NOT_FOUND) return ESP_OK;
+    if (err != ESP_OK) return err;
+    err = esp_hidd_ble_restore_ccc(s.hid, &ccc);
+    if (err == ESP_OK) {
+        s.persisted_ccc = ccc;
+        s.ccc_persisted = true;
+        ESP_LOGI(TAG, "Restored bonded HID subscriptions (%u descriptors)", ccc.count);
+    }
+    return err;
+}
 static void ready_if_subscribed(void)
 {
     if (!s.connected || !s.encrypted || !s.saved || s.awaiting_save) return;
-    if (!s.subscribed) {
-        uint8_t zero[8] = {0};
-        s.subscribed = esp_hidd_dev_input_set(s.hid, 0, 1, zero, 8) == ESP_OK;
+    esp_hidd_ccc_t ccc;
+    s_operation = "HID subscriptions";
+    esp_err_t err = esp_hidd_ble_get_ccc(s.hid, &ccc);
+    if (err == ESP_OK && (!s.ccc_persisted || memcmp(&ccc, &s.persisted_ccc, sizeof(ccc)))) {
+        err = bt_ccc_save(local_identity(), s.peer_identity, s.peer_identity_type, &ccc);
+        if (err == ESP_OK) {
+            s.persisted_ccc = ccc;
+            s.ccc_persisted = true;
+        }
     }
+    if (err != ESP_OK) { fail(err); return; }
+    s.subscribed = false;
+    for (unsigned i = 0; i < ccc.count; ++i)
+        if (ccc.reports[i].map_index == 0 && ccc.reports[i].report_id == 1
+            && ccc.reports[i].protocol_mode == ESP_HID_PROTOCOL_MODE_REPORT)
+            s.subscribed = (ccc.reports[i].value & 1) != 0;
     if (s.subscribed) {
         s.connect_deadline = s.pair_deadline = 0;
         status(s.suspended ? BT_SUSPENDED : BT_CONNECTED, ESP_OK);
-    }
+    } else status(BT_CONNECTING, ESP_OK);
 }
 static void post_peer(bool bonded, uint8_t type, const uint8_t *peer)
 {
@@ -372,8 +527,8 @@ static void tap(const message_t *msg)
         if (sent) result.type = APP_EVT_BT_TX_DONE;
         else if (context.failed && desired_session() == s.session) {
             // Never leave a key or modifier held after a failed release.
-            stop_runtime();
-            esp_err_t restarted = start_runtime();
+            esp_err_t restarted = stop_runtime();
+            if (restarted == ESP_OK) restarted = start_runtime();
             if (restarted != ESP_OK) fail(restarted);
         }
     }
@@ -386,26 +541,28 @@ static void worker(void *arg)
         if (xQueueReceive(s_queue, &msg, pdMS_TO_TICKS(25)) == pdTRUE) {
             if (msg.type == MSG_OPEN) {
                 if (msg.session != desired_session()) continue;
-                stop_runtime();
+                esp_err_t err = stop_runtime();
                 s.session = msg.session;
                 s.profile = msg.remote;
                 s.profile_index = msg.profile_index;
-                esp_err_t err = start_runtime();
+                if (err == ESP_OK) err = start_runtime();
                 if (err != ESP_OK) fail(err);
             } else if (msg.type == MSG_CLOSE) {
                 // The desired-session check below also handles a full queue.
             } else if (msg.type == MSG_FORGET && msg.session == s.session && msg.session == desired_session()) {
-                stop_runtime();
-                // Initialize without advertising, remove the stored peer, then
-                // wait for the UI to commit the cleared profile before pairing.
-                remote_t old = s.profile;
-                s.profile.bt.bonded = 0;
-                esp_err_t err = start_runtime();
-                s.profile = old;
-                if (err == ESP_OK && old.bt.bonded && !bond_used_elsewhere(old.bt.peer) && bond_exists(old.bt.peer)) {
+                esp_err_t err = stop_runtime();
+                // Open only the selected bond store. No HID service, payload,
+                // privacy/whitelist setup or advertising runs during removal.
+                if (err == ESP_OK) err = start_stack();
+                esp_ble_bond_dev_t bond;
+                esp_err_t bond_err = s.profile.bt.bonded && err == ESP_OK
+                    ? find_bond(s.profile.bt.peer, s.profile.bt.addr_type, &bond) : ESP_ERR_NOT_FOUND;
+                if (err == ESP_OK && bond_err != ESP_OK && bond_err != ESP_ERR_NOT_FOUND) err = bond_err;
+                if (err == ESP_OK && bond_err == ESP_OK && !bond_used_elsewhere(&bond)) {
+                    s_operation = "Remove bond";
                     xEventGroupClearBits(s_events, BOND_REMOVED);
                     s_remove_result = ESP_FAIL;
-                    err = esp_ble_remove_bond_device(old.bt.peer);
+                    err = esp_ble_remove_bond_device(bond.bd_addr);
                     if (err == ESP_OK) {
                         EventBits_t bits = xEventGroupWaitBits(s_events, BOND_REMOVED, pdTRUE, pdTRUE, pdMS_TO_TICKS(1500));
                         err = (bits & BOND_REMOVED) ? s_remove_result : ESP_ERR_TIMEOUT;
@@ -413,7 +570,13 @@ static void worker(void *arg)
                 }
                 if (err != ESP_OK) fail(err);
                 else {
-                    s.forgetting = true; s.pair_after = msg.flag;
+                    // Subscription preferences belong to the removed bond.
+                    s_operation = "Forget HID subscriptions";
+                    err = bt_ccc_forget(local_identity());
+                    if (err != ESP_OK) { fail(err); continue; }
+                    s.start_deadline = 0;
+                    s.forgetting = true;
+                    s.pair_after = msg.flag;
                     post_peer(false, 0, NULL);
                 }
             } else if (msg.type == MSG_SAVED && msg.session == s.session && s.awaiting_save) {
@@ -423,12 +586,15 @@ static void worker(void *arg)
                 if (s.forgetting) {
                     s.profile = msg.remote;
                     s.forgetting = false;
-                    if (!s.pair_after) { stop_runtime(); status(BT_UNPAIRED, ESP_OK); }
+                    if (!s.pair_after) {
+                        esp_err_t err = stop_runtime();
+                        status(err == ESP_OK ? BT_UNPAIRED : BT_ERROR, err);
+                    }
                     else {
-                        // Restart with the new, durably saved keyboard identity.
-                        // Windows must discover a fresh accessory after Unpair.
-                        stop_runtime();
-                        esp_err_t err = start_runtime();
+                        // Only after durable profile storage select the isolated
+                        // key store and advertise the SAME keyboard identity.
+                        esp_err_t err = stop_runtime();
+                        if (err == ESP_OK) err = start_runtime();
                         if (err != ESP_OK) fail(err);
                     }
                 } else {
@@ -438,8 +604,8 @@ static void worker(void *arg)
                     // UI's durable-save acknowledgment. Resume its reconnect
                     // path rather than waiting forever without advertising.
                     if (!s.connected) {
-                        stop_runtime();
-                        esp_err_t err = start_runtime();
+                        esp_err_t err = stop_runtime();
+                        if (err == ESP_OK) err = start_runtime();
                         if (err != ESP_OK) fail(err);
                     } else ready_if_subscribed();
                 }
@@ -448,26 +614,75 @@ static void worker(void *arg)
             else if (msg.generation && msg.generation == s.generation && s.host_on) {
                 if (desired_session() != s.session) continue;
                 switch (msg.type) {
-                    case MSG_HID_READY: s.hid_ready = true; break;
+                    case MSG_HID_READY:
+                        s_operation = "Restore HID subscriptions";
+                        msg.error = restore_subscriptions();
+                        s.hid_ready = msg.error == ESP_OK;
+                        break;
                     case MSG_ADV_DATA: s_operation = "Adv payload"; s.adv_ready = msg.error == ESP_OK; break;
                     case MSG_SCAN_DATA: s_operation = "Scan response"; s.scan_ready = msg.error == ESP_OK; break;
                     case MSG_ADDRESS: s_operation = "BT identity"; s.address_ready = msg.error == ESP_OK; break;
                     case MSG_WHITELIST:
                         s_operation = "Saved peer";
                         if (msg.error == ESP_OK && msg.key == ESP_BLE_WHITELIST_CLEAR && !s.pairing) {
-                            esp_ble_wl_addr_type_t type = (s.profile.bt.addr_type & 1) ? BLE_WL_ADDR_TYPE_RANDOM : BLE_WL_ADDR_TYPE_PUBLIC;
-                            esp_err_t err = esp_ble_gap_update_whitelist(true, s.profile.bt.peer, type);
+                            esp_ble_wl_addr_type_t type = s.peer_identity_type == BLE_ADDR_TYPE_RANDOM
+                                ? BLE_WL_ADDR_TYPE_RANDOM : BLE_WL_ADDR_TYPE_PUBLIC;
+                            esp_err_t err = esp_ble_gap_update_whitelist(true, s.peer_identity, type);
                             if (err != ESP_OK) fail(err);
-                        } else s.whitelist_ready = msg.error == ESP_OK;
+                        } else if (msg.error == ESP_OK) {
+                            s.whitelist_ready = true;
+                            if (!s.peer_has_irk) {
+                                s.privacy_phase = PRIVACY_READY;
+                                s.privacy_ready = true;
+                            } else {
+                                // Bluedroid restores bonded IRKs into the S3 resolving list on enable.
+                                // Device privacy accepts both the peer identity and its RPA, keeping
+                                // fixed-address hosts working. Completion also checks the entry exists.
+                                s_operation = "Peer privacy";
+                                esp_err_t err = esp_ble_gap_set_privacy_mode(s.peer_identity_type,
+                                    s.peer_identity, ESP_BLE_DEVICE_PRIVACY_MODE);
+                                if (err != ESP_OK) fail(err);
+                            }
+                        }
+                        break;
+                    case MSG_PEER_PRIVACY:
+                        s_operation = "Peer privacy";
+                        if (msg.error == ESP_OK) {
+                            s_operation = "Address resolution";
+                            s.privacy_phase = PRIVACY_ENABLING;
+                            esp_err_t err = esp_ble_gap_config_local_privacy(true);
+                            if (err != ESP_OK) fail(err);
+                        }
+                        break;
+                    case MSG_PRIVACY:
+                        s_operation = s.privacy_phase == PRIVACY_RESETTING ? "Privacy reset" : "Address resolution";
+                        if (msg.error == ESP_OK && s.privacy_phase == PRIVACY_RESETTING) {
+                            s.privacy_phase = PRIVACY_PREPARING;
+                            s_operation = "Clear peers";
+                            esp_err_t err = esp_ble_gap_clear_whitelist();
+                            if (err != ESP_OK) fail(err);
+                        } else if (msg.error == ESP_OK && s.privacy_phase == PRIVACY_ENABLING) {
+                            s.privacy_phase = PRIVACY_READY;
+                            s.privacy_ready = true;
+                            ESP_LOGI(TAG, "Peer address resolution enabled");
+                        }
                         break;
                     case MSG_ADV_STARTED:
-                        if (msg.error == ESP_OK) status(s.pairing ? BT_PAIRING : BT_RECONNECTING, ESP_OK);
+                        if (msg.error == ESP_OK) {
+                            s.start_deadline = 0;
+                            uint8_t address[6], type;
+                            if (esp_ble_gap_get_local_used_addr(address, &type) == ESP_OK)
+                                ESP_LOGI(TAG, "Advertising type %u at %02x:%02x:%02x:%02x:%02x:%02x",
+                                    type, address[0], address[1], address[2], address[3], address[4], address[5]);
+                            status(s.pairing ? BT_PAIRING : BT_RECONNECTING, ESP_OK);
+                        }
                         break;
                     case MSG_CONNECTED:
                         if (!s.connected) {
                             memcpy(s.peer, msg.peer, 6);
                             s.connected = true; s.advertising = false;
                             s.connect_deadline = esp_timer_get_time() + 30000000LL;
+                            ESP_LOGI(TAG, "GATT link established");
                             status(BT_CONNECTING, ESP_OK);
                         }
                         break;
@@ -484,12 +699,26 @@ static void worker(void *arg)
                             msg.error = ESP_OK; // This failure is recoverable.
                             break;
                         }
+                        if (!s.pairing && !authenticated_saved_peer(&msg)) {
+                            s_operation = "Unexpected peer";
+                            fail(ESP_ERR_INVALID_STATE);
+                            break;
+                        }
+                        if (s.pairing) {
+                            // Keep the identity for later authentication events on this link too.
+                            // Bluedroid commits bonding keys before delivering AUTH_CMPL.
+                            esp_ble_bond_dev_t bond;
+                            esp_err_t err = find_bond(msg.peer, msg.addr_type, &bond);
+                            if (err == ESP_OK)
+                                err = bond_identity(&bond, s.peer_identity, &s.peer_identity_type, &s.peer_has_irk);
+                            if (err != ESP_OK) { fail(err); break; }
+                        }
                         s.encrypted = true;
                         if (s.pairing) {
                             s.profile.bt.bonded = 1;
-                            s.profile.bt.addr_type = msg.addr_type;
-                            memcpy(s.profile.bt.peer, msg.peer, 6);
-                            post_peer(true, msg.addr_type, msg.peer);
+                            s.profile.bt.addr_type = s.peer_identity_type;
+                            memcpy(s.profile.bt.peer, s.peer_identity, 6);
+                            post_peer(true, s.peer_identity_type, s.peer_identity);
                         } else ready_if_subscribed();
                         break;
                     case MSG_DISCONNECTED:
@@ -498,8 +727,8 @@ static void worker(void *arg)
                             s.connect_deadline = 0;
                             // Once paired, reconnect only to this profile's host.
                             if (s.saved && s.profile.bt.bonded) {
-                                stop_runtime();
-                                esp_err_t err = start_runtime();
+                                esp_err_t err = stop_runtime();
+                                if (err == ESP_OK) err = start_runtime();
                                 if (err != ESP_OK) fail(err);
                             } else status(BT_PAIRING, ESP_OK);
                         }
@@ -517,10 +746,13 @@ static void worker(void *arg)
             }
         }
         if (!desired_session() && s.session) {
-            stop_runtime(); status(BT_OFF, ESP_OK); s.session = 0;
+            esp_err_t err = stop_runtime();
+            status(err == ESP_OK ? BT_OFF : BT_ERROR, err);
+            s.session = 0;
         }
         int64_t now = esp_timer_get_time();
-        if (s.host_on && s.save_deadline && now >= s.save_deadline) {
+        if (s.host_on && ((s.start_deadline && now >= s.start_deadline)
+            || (s.save_deadline && now >= s.save_deadline))) {
             fail(ESP_ERR_TIMEOUT);
         }
         if (s.host_on && ((s.pair_deadline && now >= s.pair_deadline)
