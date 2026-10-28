@@ -169,7 +169,7 @@ static void home_handle(ui_ctx_t *ctx, const ui_event_t *event)
         ctx->menu_sel = 0;
         remote_t remote;
         if (!app_remote_get(ctx->active_remote, &remote)) return;
-        if (remote.transport == REMOTE_BT && remote.bt.kind == BT_REMOTE_KEYBOARD) {
+        if (remote.transport == REMOTE_BT && remote.bt.kind <= BT_REMOTE_MOUSE) {
             if (open_bt(ctx, &remote)) {
                 ctx->bt_menu_sel = 0;
                 ui_nav_push(ctx, UI_SCREEN_BT_DEVICE, NULL);
@@ -177,19 +177,58 @@ static void home_handle(ui_ctx_t *ctx, const ui_event_t *event)
         } else ui_nav_push(ctx, UI_SCREEN_EDIT, NULL);
     }
 }
+static bool save_mouse_speed(ui_ctx_t *ctx, remote_t *remote, unsigned speed)
+{
+    remote->bt.mouse_speed = speed;
+    if (app_remote_update(ctx->active_remote, remote) != ESP_OK) {
+        notice(ctx, "Save failed"); return false;
+    }
+    return true;
+}
+static void mouse_handle(ui_ctx_t *ctx, const remote_t *remote, const ui_event_t *event)
+{
+    unsigned key = event->value;
+    if (!(bt_mouse_mask(remote->bt.mouse_mode) & (1u << (key - 1)))) {
+        if (event->type != UI_EV_KEY_RELEASE) snprintf(ctx->tx_status, sizeof(ctx->tx_status), "Unassigned");
+        return;
+    }
+    bool patterns = remote->bt.mouse_mode == BT_MOUSE_PATTERNS;
+    unsigned faster = patterns ? REMOTE_KEY_VOL_UP : REMOTE_KEY_CUSTOM4;
+    unsigned slower = patterns ? REMOTE_KEY_VOL_DOWN : REMOTE_KEY_CUSTOM5;
+    if (key == faster || key == slower) {
+        if (event->type == UI_EV_KEY_RELEASE || event->type == UI_EV_KEY_LONG) return;
+        remote_t updated = *remote;
+        unsigned speed = bt_mouse_speed(remote);
+        if (key == faster && speed < BT_MOUSE_SPEED_MAX) ++speed;
+        if (key == slower && speed > 1) --speed;
+        if (speed != bt_mouse_speed(remote) && !save_mouse_speed(ctx, &updated, speed)) return;
+        snprintf(ctx->tx_status, sizeof(ctx->tx_status), "Speed %u/10", speed);
+        return;
+    }
+    bt_mouse_input_t input = event->type == UI_EV_KEY_RELEASE ? BT_MOUSE_RELEASE
+        : event->type == UI_EV_OK_LONG || event->type == UI_EV_KEY_LONG ? BT_MOUSE_HOLD
+        : event->repeat ? BT_MOUSE_REPEAT : BT_MOUSE_PRESS;
+    ctx->last_key = key;
+    if (!bt_keyboard_mouse_input(ctx->bt_session, key, input, event->ts_ms))
+        snprintf(ctx->tx_status, sizeof(ctx->tx_status), "BT offline");
+    else snprintf(ctx->tx_status, sizeof(ctx->tx_status), "%s", bt_mouse_key_label(remote->bt.mouse_mode, key));
+}
 static void remote_handle(ui_ctx_t *ctx, const ui_event_t *event)
 {
     if (event->type == UI_EV_MODE) {
         ctx->bt_power_pending = false;
-        if (ctx->bt_session) bt_keyboard_release(ctx->bt_session);
         ctx->tx_request = 0;
         ui_nav_pop(ctx); return;
     }
-    if (event->type == UI_EV_OK_LONG || event->type == UI_EV_BACK_LONG
-        || event->type == UI_EV_HOME_LONG || event->src != UI_SRC_KEYPAD) return;
+    if (event->type == UI_EV_BACK_LONG || event->type == UI_EV_HOME_LONG || event->src != UI_SRC_KEYPAD) return;
     unsigned key = event->value;
     remote_t remote;
     if (!remote_key_assignable(key) || !app_remote_get(ctx->active_remote, &remote)) return;
+    if (remote.transport == REMOTE_BT && remote.bt.kind == BT_REMOTE_MOUSE) {
+        if (event->type != UI_EV_POWER_LONG) mouse_handle(ctx, &remote, event);
+        return;
+    }
+    if (event->type == UI_EV_OK_LONG || event->type == UI_EV_KEY_LONG) return;
     if (remote.transport == REMOTE_BT && remote.bt.kind == BT_REMOTE_KEYBOARD) {
         bool fire_power = remote.bt.preset == BT_PRESET_FIRE_TV && key == REMOTE_KEY_POWER;
         bool long_power = event->type == UI_EV_POWER_LONG && key == REMOTE_KEY_POWER;
@@ -245,11 +284,16 @@ static void remote_render(ui_ctx_t *ctx, u8g2_t *u8)
     center(u8, 62, remote.transport == REMOTE_IR ? info : remote.transport == REMOTE_BT
         ? bt_keyboard_status_name(ctx->bt_status.state) : "Not ready");
     u8g2_DrawFrame(u8, 1, 70, 62, 38);
-    center(u8, 79, "LAST BUTTON");
+    bool mouse = remote.transport == REMOTE_BT && remote.bt.kind == BT_REMOTE_MOUSE;
+    char speed[20];
+    snprintf(speed, sizeof(speed), "%s %u/10", ctx->bt_status.mouse_buttons & 1 ? "HOLD" : "Speed", bt_mouse_speed(&remote));
+    center(u8, 79, mouse ? speed : "LAST BUTTON");
     u8g2_SetFont(u8, u8g2_font_6x10_tf);
-    center(u8, 92, ctx->last_key ? remote_key_name(ctx->last_key) : "Press key");
+    center(u8, 92, mouse && ctx->bt_status.mouse_movement ? remote_key_name(ctx->bt_status.mouse_movement)
+        : ctx->last_key ? remote_key_name(ctx->last_key) : "Press key");
     u8g2_SetFont(u8, u8g2_font_5x8_tf);
-    center(u8, 103, ctx->tx_status);
+    center(u8, 103, mouse && ctx->bt_status.mouse_movement
+        ? bt_mouse_key_label(remote.bt.mouse_mode, ctx->bt_status.mouse_movement) : ctx->tx_status);
     footer(ctx, u8, "Press keys", ctx->bt_session ? "MODE:BT menu" : "MODE:browse");
 }
 static void edit_handle(ui_ctx_t *ctx, const ui_event_t *event)
@@ -321,7 +365,7 @@ static void type_render(ui_ctx_t *ctx, u8g2_t *u8)
     row(u8, 49, "BT", ctx->type_sel == 1);
     row(u8, 70, "WIFI", ctx->type_sel == 2);
     u8g2_SetFont(u8, u8g2_font_5x8_tf);
-    center(u8, 103, ctx->type_sel == REMOTE_BT ? "BT keyboard" : ctx->type_sel ? "Coming soon" : "IR learning");
+    center(u8, 103, ctx->type_sel == REMOTE_BT ? "Keyboard/mouse" : ctx->type_sel ? "Coming soon" : "IR learning");
     footer(ctx, u8, "OK:next", "BACK:cancel");
 }
 static void bt_type_handle(ui_ctx_t *ctx, const ui_event_t *event)
@@ -330,12 +374,13 @@ static void bt_type_handle(ui_ctx_t *ctx, const ui_event_t *event)
     if (event->type == UI_EV_DOWN && ctx->bt_type_sel < 2) ++ctx->bt_type_sel;
     if (event->type == UI_EV_BACK) { ui_nav_pop(ctx); return; }
     if (event->type != UI_EV_OK) return;
-    if (ctx->bt_type_sel) { notice(ctx, "On hold"); return; }
+    if (ctx->bt_type_sel == BT_REMOTE_CONTROLLER) { notice(ctx, "On hold"); return; }
     memset(&ctx->draft.bt, 0, sizeof(ctx->draft.bt));
-    ctx->draft.bt.kind = BT_REMOTE_KEYBOARD;
+    ctx->draft.bt.kind = ctx->bt_type_sel;
+    ctx->draft.bt.mouse_speed = BT_MOUSE_SPEED_DEFAULT;
     remote_bt_ensure_identity(&ctx->draft);
     ctx->draft.bt.bond_store = BT_BOND_STORE_PROFILE;
-    ctx->draft.assigned = bt_keymap_mask();
+    ctx->draft.assigned = ctx->bt_type_sel == BT_REMOTE_MOUSE ? bt_mouse_mask(BT_MOUSE_MAPPED) : bt_keymap_mask();
     ui_nav_push(ctx, UI_SCREEN_NAME, NULL);
 }
 static void bt_type_render(ui_ctx_t *ctx, u8g2_t *u8)
@@ -345,15 +390,18 @@ static void bt_type_render(ui_ctx_t *ctx, u8g2_t *u8)
     row(u8, 49, "Mouse", ctx->bt_type_sel == 1);
     row(u8, 70, "Controller", ctx->bt_type_sel == 2);
     u8g2_SetFont(u8, u8g2_font_5x8_tf);
-    center(u8, 102, ctx->bt_type_sel ? "On hold" : "Choose preset");
+    center(u8, 102, ctx->bt_type_sel == BT_REMOTE_CONTROLLER ? "On hold" : "Choose preset");
     footer(ctx, u8, "OK:select", "BACK:connect");
 }
 static void bt_device_handle(ui_ctx_t *ctx, const ui_event_t *event)
 {
+    remote_t selected;
+    if (!app_remote_get(ctx->active_remote, &selected)) return;
+    bool mouse = selected.bt.kind == BT_REMOTE_MOUSE;
     if (event->type == UI_EV_MODE) { enter_remote_mode(ctx); return; }
     if (event->type == UI_EV_BACK) { ui_nav_pop(ctx); return; }
     if (event->type == UI_EV_UP && ctx->bt_menu_sel) --ctx->bt_menu_sel;
-    if (event->type == UI_EV_DOWN && ctx->bt_menu_sel < 4) ++ctx->bt_menu_sel;
+    if (event->type == UI_EV_DOWN && ctx->bt_menu_sel < (mouse ? 5 : 4)) ++ctx->bt_menu_sel;
     if (event->type != UI_EV_OK) return;
     if (ctx->bt_menu_sel == 0) {
         if (ctx->bt_status.state == BT_CONNECTED || ctx->bt_status.state == BT_SUSPENDED) {
@@ -368,6 +416,9 @@ static void bt_device_handle(ui_ctx_t *ctx, const ui_event_t *event)
     } else if (ctx->bt_menu_sel == 3) {
         ctx->bt_key_sel = 1;
         ui_nav_push(ctx, UI_SCREEN_BT_KEYS, NULL);
+    } else if (mouse && ctx->bt_menu_sel == 4) {
+        ctx->bt_speed_draft = bt_mouse_speed(&selected);
+        ui_nav_push(ctx, UI_SCREEN_BT_SPEED, NULL);
     } else {
         ctx->menu_sel = 0;
         ui_nav_push(ctx, UI_SCREEN_EDIT, NULL);
@@ -377,20 +428,47 @@ static void bt_device_render(ui_ctx_t *ctx, u8g2_t *u8)
 {
     remote_t remote;
     if (!app_remote_get(ctx->active_remote, &remote)) return;
-    title(u8, "Keyboard", "BT");
+    bool mouse = remote.bt.kind == BT_REMOTE_MOUSE;
+    title(u8, mouse ? "Mouse" : "Keyboard", "BT");
     u8g2_SetFont(u8, u8g2_font_6x10_tf);
-    center(u8, 29, ctx->bt_status.state == BT_ERROR && ctx->bt_status.step ? ctx->bt_status.step : remote.name);
+    bool progress = ctx->bt_status.state == BT_STARTING || ctx->bt_status.state == BT_STOPPING || ctx->bt_status.state == BT_ERROR;
+    center(u8, 29, progress && ctx->bt_status.step ? ctx->bt_status.step : remote.name);
     u8g2_SetFont(u8, u8g2_font_5x8_tf);
     char status_line[24];
     snprintf(status_line, sizeof(status_line), "BT error %04X", (unsigned)ctx->bt_status.error);
     center(u8, 42, ctx->bt_status.state == BT_ERROR ? status_line : bt_keyboard_status_name(ctx->bt_status.state));
     static const char *const items[] = {"Reconnect", "Pair new", "Unpair", "Key map", "Edit remote"};
+    static const char *const mouse_items[] = {"Reconnect", "Pair new", "Unpair", "Key map", "Speed", "Edit remote"};
+    char speed[20];
+    snprintf(speed, sizeof(speed), "Speed %u/10", bt_mouse_speed(&remote));
     unsigned first = ctx->bt_menu_sel > 1 ? ctx->bt_menu_sel - 1 : 0;
-    if (first > 2) first = 2;
+    if (first > (mouse ? 3 : 2)) first = mouse ? 3 : 2;
     for (unsigned i = first; i < first + 3; ++i)
-        row(u8, 50 + (i - first) * 18, items[i], ctx->bt_menu_sel == i);
+        row(u8, 50 + (i - first) * 18, mouse ? (i == 4 ? speed : mouse_items[i]) : items[i], ctx->bt_menu_sel == i);
     footer(ctx, u8, ctx->bt_status.state == BT_PAIRING && ctx->bt_status.error != ESP_OK
         ? "Forget on host" : ctx->bt_status.state == BT_UNPAIRED ? "Forget on host" : "MODE:use", "BACK:BT off");
+}
+static void bt_speed_handle(ui_ctx_t *ctx, const ui_event_t *event)
+{
+    if (event->type == UI_EV_BACK) { ui_nav_pop(ctx); return; }
+    if ((event->type == UI_EV_UP || event->type == UI_EV_RIGHT || (event->type == UI_EV_KEY && event->value == REMOTE_KEY_VOL_UP))
+        && ctx->bt_speed_draft < BT_MOUSE_SPEED_MAX) ++ctx->bt_speed_draft;
+    if ((event->type == UI_EV_DOWN || event->type == UI_EV_LEFT || (event->type == UI_EV_KEY && event->value == REMOTE_KEY_VOL_DOWN))
+        && ctx->bt_speed_draft > 1) --ctx->bt_speed_draft;
+    if (event->type != UI_EV_OK) return;
+    remote_t remote;
+    if (app_remote_get(ctx->active_remote, &remote) && save_mouse_speed(ctx, &remote, ctx->bt_speed_draft)) ui_nav_pop(ctx);
+}
+static void bt_speed_render(ui_ctx_t *ctx, u8g2_t *u8)
+{
+    title(u8, "Speed", "BT");
+    char speed[16];
+    snprintf(speed, sizeof(speed), "%u / 10", ctx->bt_speed_draft);
+    u8g2_SetFont(u8, u8g2_font_6x10_tf);
+    center(u8, 48, speed);
+    u8g2_SetFont(u8, u8g2_font_5x8_tf);
+    center(u8, 70, "UP:faster"); center(u8, 83, "DOWN:slower");
+    footer(ctx, u8, "OK:save", "BACK:cancel");
 }
 static void bt_confirm_handle(ui_ctx_t *ctx, const ui_event_t *event)
 {
@@ -418,7 +496,7 @@ static void bt_keys_handle(ui_ctx_t *ctx, const ui_event_t *event)
 {
     remote_t remote;
     if (!app_remote_get(ctx->active_remote, &remote)) return;
-    if (remote.bt.preset >= BT_PRESET_TEXT) {
+    if (remote.bt.kind == BT_REMOTE_KEYBOARD && remote.bt.preset >= BT_PRESET_TEXT) {
         if (event->type == UI_EV_MODE) { ui_nav_pop(ctx); return; }
         if (event->src != UI_SRC_KEYPAD || event->repeat || !remote_key_assignable(event->value)
             || event->type == UI_EV_BACK_LONG || event->type == UI_EV_HOME_LONG
@@ -454,8 +532,9 @@ static void bt_keys_render(ui_ctx_t *ctx, u8g2_t *u8)
     if (!app_remote_get(ctx->active_remote, &remote)) return;
     title(u8, "Key map", "BT");
     u8g2_SetFont(u8, u8g2_font_5x8_tf);
-    center(u8, 31, bt_preset_name(remote.bt.preset));
-    if (remote.bt.preset >= BT_PRESET_TEXT) {
+    bool mouse = remote.bt.kind == BT_REMOTE_MOUSE;
+    center(u8, 31, mouse ? bt_mouse_mode_name(remote.bt.mouse_mode) : bt_preset_name(remote.bt.preset));
+    if (!mouse && remote.bt.preset >= BT_PRESET_TEXT) {
         u8g2_SetFont(u8, u8g2_font_6x10_tf);
         center(u8, 51, "Press a key");
         center(u8, 64, "to assign");
@@ -470,9 +549,14 @@ static void bt_keys_render(ui_ctx_t *ctx, u8g2_t *u8)
     u8g2_SetFont(u8, u8g2_font_6x10_tf);
     center(u8, 53, remote_key_name(ctx->bt_key_sel));
     bt_binding_t binding = bt_profile_binding(&remote, ctx->bt_key_sel);
-    center(u8, 72, binding.keycode ? bt_keycode_label(binding.keycode) : "Unassigned");
+    center(u8, 72, mouse ? bt_mouse_key_label(remote.bt.mouse_mode, ctx->bt_key_sel)
+        : binding.keycode ? bt_keycode_label(binding.keycode) : "Unassigned");
     u8g2_SetFont(u8, u8g2_font_5x8_tf);
-    if (remote.bt.preset == BT_PRESET_FIRE_TV && ctx->bt_key_sel == REMOTE_KEY_POWER) {
+    if (mouse && remote.bt.mouse_mode == BT_MOUSE_PATTERNS) {
+        center(u8, 91, "Tap:toggle"); center(u8, 102, "Hold:until up");
+    } else if (mouse && ctx->bt_key_sel == REMOTE_KEY_OK) {
+        center(u8, 91, "Hold:drag"); center(u8, 102, "Tap:drop");
+    } else if (!mouse && remote.bt.preset == BT_PRESET_FIRE_TV && ctx->bt_key_sel == REMOTE_KEY_POWER) {
         center(u8, 91, "Hold POWER:"); center(u8, 102, "Ctrl+Alt+Del");
     } else center(u8, 99, "Mapping fixed");
     footer(ctx, u8, "UP/DOWN:keys", "BACK:BT menu");
@@ -642,7 +726,7 @@ static void icon_handle(ui_ctx_t *ctx, const ui_event_t *event)
         return;
     }
     if (ctx->draft.transport == REMOTE_BT) {
-        ctx->bt_preset_sel = ctx->draft.bt.preset;
+        ctx->bt_preset_sel = ctx->draft.bt.kind == BT_REMOTE_MOUSE ? ctx->draft.bt.mouse_mode : ctx->draft.bt.preset;
         ui_nav_push(ctx, UI_SCREEN_BT_PRESET, NULL);
     } else create_remote(ctx);
 }
@@ -659,7 +743,7 @@ static void create_remote(ui_ctx_t *ctx)
         if (app_remote_get(index, &remote) && open_bt(ctx, &remote)) {
             ctx->bt_menu_sel = 0;
             ui_nav_push(ctx, UI_SCREEN_BT_DEVICE, NULL);
-            if (remote.bt.preset >= BT_PRESET_TEXT) {
+            if (remote.bt.kind == BT_REMOTE_KEYBOARD && remote.bt.preset >= BT_PRESET_TEXT) {
                 ctx->bt_key_sel = 1;
                 ui_nav_push(ctx, UI_SCREEN_BT_KEYS, NULL);
             }
@@ -688,21 +772,24 @@ static void icon_render(ui_ctx_t *ctx, u8g2_t *u8)
 }
 static void bt_preset_handle(ui_ctx_t *ctx, const ui_event_t *event)
 {
+    bool mouse = ctx->draft.bt.kind == BT_REMOTE_MOUSE;
     if (event->type == UI_EV_BACK) { ui_nav_pop(ctx); return; }
     if (event->type == UI_EV_UP && ctx->bt_preset_sel) --ctx->bt_preset_sel;
-    if (event->type == UI_EV_DOWN && ctx->bt_preset_sel < BT_PRESET_CUSTOM) ++ctx->bt_preset_sel;
+    if (event->type == UI_EV_DOWN && ctx->bt_preset_sel < (mouse ? BT_MOUSE_PATTERNS : BT_PRESET_CUSTOM)) ++ctx->bt_preset_sel;
     if (event->type != UI_EV_OK) return;
-    ctx->draft.bt.preset = ctx->bt_preset_sel;
+    if (mouse) ctx->draft.bt.mouse_mode = ctx->bt_preset_sel;
+    else ctx->draft.bt.preset = ctx->bt_preset_sel;
     memset(ctx->draft.bt.bindings, 0, sizeof(ctx->draft.bt.bindings));
     ctx->draft.assigned = 0;
-    ctx->draft.assigned = bt_profile_mask(&ctx->draft);
+    ctx->draft.assigned = mouse ? bt_mouse_mask(ctx->draft.bt.mouse_mode) : bt_profile_mask(&ctx->draft);
     create_remote(ctx);
 }
 static void bt_preset_render(ui_ctx_t *ctx, u8g2_t *u8)
 {
-    title(u8, "BT preset", NULL);
-    for (unsigned i = 0; i <= BT_PRESET_CUSTOM; ++i)
-        row(u8, 24 + i * 21, bt_preset_name(i), ctx->bt_preset_sel == i);
+    bool mouse = ctx->draft.bt.kind == BT_REMOTE_MOUSE;
+    title(u8, mouse ? "Mouse mode" : "BT preset", NULL);
+    for (unsigned i = 0; i <= (mouse ? BT_MOUSE_PATTERNS : BT_PRESET_CUSTOM); ++i)
+        row(u8, 24 + i * 21, mouse ? bt_mouse_mode_name(i) : bt_preset_name(i), ctx->bt_preset_sel == i);
     footer(ctx, u8, "OK:select", "BACK:icon");
 }
 void ui_cancel_learning(ui_ctx_t *ctx)
@@ -875,6 +962,7 @@ static void screen_enter(ui_ctx_t *ctx, void *param)
 }
 static void screen_exit(ui_ctx_t *ctx)
 {
+    if (screen_id(ctx) == UI_SCREEN_REMOTE && ctx->bt_session) bt_keyboard_release(ctx->bt_session);
     if (screen_id(ctx) == UI_SCREEN_IR_WAIT) ui_cancel_learning(ctx);
     if (screen_id(ctx) == UI_SCREEN_BT_DEVICE && ctx->bt_session) {
         bt_keyboard_close();
@@ -889,7 +977,8 @@ static void screen_handle(ui_ctx_t *ctx, const ui_event_t *event)
         if (ctx->bt_session) {
             bt_snapshot_t snapshot = bt_keyboard_snapshot();
             if (snapshot.session == ctx->bt_session && (snapshot.state != ctx->bt_status.state
-                || snapshot.error != ctx->bt_status.error)) {
+                || snapshot.error != ctx->bt_status.error || snapshot.step != ctx->bt_status.step || snapshot.mouse_movement != ctx->bt_status.mouse_movement
+                || snapshot.mouse_buttons != ctx->bt_status.mouse_buttons)) {
                 ctx->bt_status = snapshot;
                 if (snapshot.state == BT_CONNECTED && !ctx->tx_request)
                     snprintf(ctx->tx_status, sizeof(ctx->tx_status), "Ready");
@@ -917,6 +1006,7 @@ static void screen_handle(ui_ctx_t *ctx, const ui_event_t *event)
         case UI_SCREEN_BT_PRESET: bt_preset_handle(ctx, event); break;
         case UI_SCREEN_BT_BINDING: bt_binding_handle(ctx, event); break;
         case UI_SCREEN_BT_TEXT: bt_text_handle(ctx, event); break;
+        case UI_SCREEN_BT_SPEED: bt_speed_handle(ctx, event); break;
         case UI_SCREEN_NAME: name_handle(ctx, event); break;
         case UI_SCREEN_ICON: icon_handle(ctx, event); break;
         case UI_SCREEN_IR_KEYS: keys_handle(ctx, event); break;
@@ -951,6 +1041,7 @@ static void screen_render(ui_ctx_t *ctx, u8g2_t *u8)
         case UI_SCREEN_BT_PRESET: bt_preset_render(ctx, u8); break;
         case UI_SCREEN_BT_BINDING: bt_binding_render(ctx, u8); break;
         case UI_SCREEN_BT_TEXT: name_render(ctx, u8); break;
+        case UI_SCREEN_BT_SPEED: bt_speed_render(ctx, u8); break;
         case UI_SCREEN_NAME: name_render(ctx, u8); break;
         case UI_SCREEN_ICON: icon_render(ctx, u8); break;
         case UI_SCREEN_IR_KEYS: keys_render(ctx, u8); break;

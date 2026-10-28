@@ -16,7 +16,7 @@ Every key except MODE controls the appliance; unassigned keys show Unassigned.
 MODE returns to the menu it was opened from (or home for the direct IR shortcut).
 
 OK on an IR remote opens its editor: Learn keys, Name, Icon and Remove.
-OK on a Bluetooth keyboard opens its connection menu and enables Bluetooth.
+OK on a Bluetooth keyboard or mouse opens its connection menu and enables Bluetooth.
 MODE works in the selected remote's menu/editor; wizard and learning screens
 keep their navigation behavior.
 Removal opens a confirmation with Cancel selected.
@@ -24,8 +24,8 @@ Removal opens a confirmation with Cancel selected.
 ## Add a remote
 
 1. **Connect**: IR, BT or WIFI.
-   BT adds Keyboard, Mouse and Controller choices. Only Keyboard can advance;
-   the others show On hold.
+   BT adds Keyboard, Mouse and Controller choices. Keyboard and Mouse can
+   advance; Controller shows On hold.
 2. **Name**: up to 12 characters. Arrows navigate a five-column keyboard and OK
    enters the selected character. Any custom button cycles abc, ABC and 123.
    The on-screen underscore inserts a space, < deletes, ^ switches keyboard,
@@ -36,9 +36,11 @@ Removal opens a confirmation with Cancel selected.
 4. **BT preset** (Bluetooth keyboards): after choosing the icon, select Fire TV,
    Media control, Text, or Custom. Fire TV and Media control open the Bluetooth
    connection menu with their mappings ready. Text and Custom open key assignment.
+   For a Bluetooth mouse, select **Mouse mapped** or **Patterns** instead. Both
+   open the connection menu with fixed mappings and a saved **Speed** setting.
 
 IR/WiFi remotes are written to storage when their icon is accepted; Bluetooth
-keyboards are saved when their preset is accepted. BACK moves
+keyboards and mice are saved when their preset/mode is accepted. BACK moves
 to the preceding step; HOME discards the uncommitted draft and returns home.
 Failed saves keep the current step open and report Save failed.
 
@@ -46,6 +48,8 @@ Pairing, reconnecting, unpairing, presets and editable mappings are described in
 [the Bluetooth guide](bluetooth.md). MODE returns from BT Remote mode to its
 menu without disconnecting. BACK from that menu or HOME from its settings
 closes the session and turns Bluetooth off.
+Mouse movement, button holds and pattern controls are covered in the
+[mouse guide](bluetooth-mouse.md).
 
 For Text or Custom, press the physical key to assign, including BACK or HOME.
 MODE finishes key assignment; holding BACK returns to the Bluetooth menu.
@@ -102,7 +106,7 @@ If saving fails after capture, Retry save retains the captured command on screen
 
 Up to 16 remotes are stored in a versioned NVS profile blob with a checksum.
 Version-1 profiles are read without losing IR recordings or Bluetooth pairings;
-subsequent saves use version 2, appending only nonempty text strings to the same
+subsequent saves use version 3, appending only nonempty text strings to the same
 checksummed snapshot. A full store reports Save failed and keeps the previous data.
 Failed create, edit, delete or key saves restore the in-memory model. An
 unreadable/corrupt store is reported without erasing or overwriting it.

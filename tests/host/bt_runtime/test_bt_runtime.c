@@ -35,6 +35,12 @@ static esp_hidd_dev_t hid;
 static esp_hidd_ccc_t hid_ccc, stored_ccc;
 static bool has_ccc;
 static unsigned controller_inits, controller_deinits, ccc_saves, ccc_restores, ccc_forgets;
+static bt_key_report_t last_report;
+static unsigned report_fail_at;
+static bool queue_full;
+static unsigned link_disconnects;
+static EventBits_t event_bits;
+static bool hold_disconnect, connect_on_stop;
 
 static void gap_event(int event, int status_code)
 {
@@ -57,6 +63,7 @@ QueueHandle_t xQueueCreate(unsigned count, unsigned size)
 { assert(size == sizeof(message_t)); memset(&queue, 0, sizeof(queue)); return &queue; }
 int xQueueSend(QueueHandle_t q, const void *item, TickType_t timeout)
 {
+    if (queue_full) return pdFALSE;
     assert(q->tail - q->head < 128);
     q->items[q->tail++ % 128] = *(const message_t *)item;
     return pdTRUE;
@@ -67,10 +74,16 @@ int xQueueReceive(QueueHandle_t q, void *item, TickType_t timeout)
     if (idle_tick) { idle_tick = false; return pdFALSE; }
     longjmp(idle, 1);
 }
-EventGroupHandle_t xEventGroupCreate(void) { return (void *)1; }
-EventBits_t xEventGroupClearBits(EventGroupHandle_t group, EventBits_t bits) { return bits; }
-EventBits_t xEventGroupSetBits(EventGroupHandle_t group, EventBits_t bits) { return bits; }
-EventBits_t xEventGroupWaitBits(EventGroupHandle_t group, EventBits_t bits, int clear, int all, TickType_t timeout) { return bits; }
+EventGroupHandle_t xEventGroupCreate(void) { event_bits = 0; return (void *)1; }
+EventBits_t xEventGroupClearBits(EventGroupHandle_t group, EventBits_t bits)
+{ EventBits_t previous = event_bits; event_bits &= ~bits; return previous; }
+EventBits_t xEventGroupSetBits(EventGroupHandle_t group, EventBits_t bits) { return event_bits |= bits; }
+EventBits_t xEventGroupWaitBits(EventGroupHandle_t group, EventBits_t bits, int clear, int all, TickType_t timeout)
+{
+    EventBits_t result = event_bits;
+    if (clear && (all ? (result & bits) == bits : (result & bits) != 0)) event_bits &= ~bits;
+    return result;
+}
 int xTaskCreate(void (*task)(void *), const char *name, unsigned stack, void *arg, unsigned priority, void *handle) { return pdPASS; }
 void vTaskDelay(TickType_t delay) { now += delay * 1000LL; }
 int64_t esp_timer_get_time(void) { return now; }
@@ -156,16 +169,44 @@ esp_err_t esp_ble_gap_start_advertising(esp_ble_adv_params_t *params)
     gap_event(ESP_GAP_BLE_ADV_START_COMPLETE_EVT, ESP_OK);
     return ESP_OK;
 }
-esp_err_t esp_ble_gap_stop_advertising(void) { gap_event(ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT, ESP_OK); return ESP_OK; }
+esp_err_t esp_ble_gap_stop_advertising(void)
+{
+    if (connect_on_stop) {
+        connect_on_stop = false;
+        esp_ble_gatts_cb_param_t param = {0};
+        memcpy(param.connect.remote_bda, profiles[0].bt.peer, 6);
+        gatts(ESP_GATTS_CONNECT_EVT, 0, &param);
+    }
+    gap_event(ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT, ESP_OK); return ESP_OK;
+}
 esp_err_t esp_ble_gap_disconnect(uint8_t *peer)
-{ esp_ble_gatts_cb_param_t param = {.disconnect.reason = 0x13}; gatts(ESP_GATTS_DISCONNECT_EVT, 0, &param); return ESP_OK; }
+{
+    ++link_disconnects;
+    if (!hold_disconnect) {
+        esp_ble_gatts_cb_param_t param = {.disconnect.reason = 0x13};
+        gatts(ESP_GATTS_DISCONNECT_EVT, 0, &param);
+    }
+    return ESP_OK;
+}
 void esp_hidd_gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t interface, esp_ble_gatts_cb_param_t *param) {}
 esp_err_t esp_hidd_dev_init(const esp_hid_device_config_t *config, int transport, esp_event_handler_t callback, esp_hidd_dev_t **device)
-{ ++hid_init_calls; *device = &hid; callback(NULL, NULL, ESP_HIDD_START_EVENT, NULL); return ESP_OK; }
+{
+    bool mouse = s.profile.bt.kind == BT_REMOTE_MOUSE;
+    CHECK(config->report_maps_len == 1 && config->report_maps[0].data == (mouse ? bt_mouse_report_map : bt_keyboard_report_map));
+    CHECK(config->report_maps[0].len == (mouse ? bt_mouse_report_map_size : bt_keyboard_report_map_size));
+    CHECK(config->product_id == (mouse ? 0x4002 : 0x4001));
+    ++hid_init_calls; *device = &hid; callback(NULL, NULL, ESP_HIDD_START_EVENT, NULL); return ESP_OK;
+}
 esp_err_t esp_hidd_dev_deinit(esp_hidd_dev_t *device) { return ESP_OK; }
 esp_err_t esp_hidd_dev_event_handler_unregister(esp_hidd_dev_t *device, esp_event_handler_t callback, int32_t event) { return ESP_OK; }
 esp_err_t esp_hidd_dev_input_set(esp_hidd_dev_t *device, size_t map, size_t report, uint8_t *data, size_t length)
-{ ++reports; return ESP_OK; }
+{
+    CHECK(map == 0 && length <= 8);
+    memset(&last_report, 0, sizeof(last_report));
+    last_report.report_id = report; last_report.length = length; memcpy(last_report.data, data, length);
+    ++reports;
+    return reports == report_fail_at ? ESP_FAIL : ESP_OK;
+}
 esp_err_t esp_hidd_ble_get_ccc(esp_hidd_dev_t *device, esp_hidd_ccc_t *ccc)
 { *ccc = hid_ccc; return ESP_OK; }
 esp_err_t esp_hidd_ble_restore_ccc(esp_hidd_dev_t *device, const esp_hidd_ccc_t *ccc)
@@ -186,6 +227,7 @@ void app_post_evt(const app_evt_t *event) { ++saved_events; saved_event = *event
 
 static void reset(bool bonded, bool private_peer)
 {
+    memset(&s_link, 0, sizeof(s_link));
     memset(&s, 0, sizeof(s));
     memset(&s_snapshot, 0, sizeof(s_snapshot));
     s_desired_session = s_callback_generation = s_input_generation = 0;
@@ -221,6 +263,9 @@ static void reset(bool bonded, bool private_peer)
     hid_ccc = (esp_hidd_ccc_t){.version = 1, .count = 1, .reports = {{0,1,ESP_HID_PROTOCOL_MODE_REPORT,1}}};
     hold_mode = hold_resolution = hold_reset = resolution_enabled = false;
     bond_read_error = mode_error = resolution_error = ESP_OK;
+    report_fail_at = 0; queue_full = false;
+    link_disconnects = 0;
+    hold_disconnect = connect_on_stop = false;
     memset(local_address, 0, 6);
     bt_keyboard_init();
 }
@@ -464,6 +509,99 @@ int main(void)
     CHECK(!s.subscribed && stored_ccc.reports[0].value == 0 && ccc_saves == 3);
     CHECK(bt_keyboard_forget(2, true)); run_worker();
     CHECK(ccc_forgets == 1 && !has_ccc);
+
+    // Mouse uses the same authenticated, durable, subscribed connection path.
+    reset(false, false);
+    profiles[0].bt.kind = BT_REMOTE_MOUSE; profiles[0].bt.mouse_mode = BT_MOUSE_PATTERNS;
+    open_profile(11);
+    CHECK(!bt_keyboard_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_PRESS, 0));
+    uint8_t mouse_peer[6] = {0x23,0,0,0,0,0x45};
+    connect_peer(mouse_peer); authenticate(mouse_peer, BLE_ADDR_TYPE_PUBLIC, true);
+    CHECK(!bt_keyboard_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, 0) && !reports);
+    profiles[0] = s.profile;
+    bt_keyboard_peer_saved(11, true, &profiles[0]); run_worker();
+    CHECK(s_snapshot.state == BT_CONNECTED);
+    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, 0)); run_worker();
+    CHECK(last_report.length == 5 && last_report.data[0] == 1 && s_snapshot.mouse_buttons == 1);
+    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_PRESS, 0)); run_worker();
+    CHECK(last_report.data[0] == 1 && last_report.data[1] == 10);
+    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_RELEASE, 100)); run_worker();
+    now += 20000; run_worker(); CHECK(last_report.data[1] == 10 && s.mouse.movement == REMOTE_KEY_RIGHT);
+    profiles[0].bt.mouse_speed = 9;
+    now += 20000; run_worker(); CHECK(last_report.data[1] == 18); // Live saved-speed update.
+    unsigned before_reports = reports;
+    now += 1000000; run_worker(); CHECK(reports == before_reports + 1); // No catch-up burst.
+    bt_keyboard_release(11); run_worker();
+    CHECK(!s.mouse.movement && !s.mouse.buttons && !last_report.data[0] && !s_snapshot.mouse_buttons);
+    now += 20000; before_reports = reports; run_worker(); CHECK(reports == before_reports);
+
+    // Queued old input and a lost release message cannot restart movement.
+    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_CUSTOM4, BT_MOUSE_PRESS, now / 1000));
+    bt_keyboard_release(11); run_worker(); CHECK(!s.mouse.movement);
+    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_PRESS, now / 1000)); run_worker();
+    queue_full = true;
+    CHECK(!bt_keyboard_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_RELEASE, now / 1000));
+    queue_full = false; run_worker(); CHECK(!s.mouse.movement && !s.mouse.buttons);
+
+    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000)); run_worker();
+    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_UP, BT_MOUSE_PRESS, now / 1000)); run_worker();
+    callback_message((message_t){.type = MSG_SUSPEND, .flag = true}); run_worker();
+    CHECK(s_snapshot.state == BT_SUSPENDED && !s.mouse.movement && !s.mouse.buttons);
+    before_reports = reports; now += 100000; run_worker(); CHECK(reports == before_reports);
+    callback_message((message_t){.type = MSG_SUSPEND, .flag = false}); run_worker();
+    CHECK(s_snapshot.state == BT_CONNECTED && !s.mouse.movement);
+
+    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000)); run_worker();
+    report_fail_at = reports + 1;
+    bt_keyboard_release(11); run_worker();
+    CHECK(s_snapshot.state == BT_RECONNECTING && !s.mouse.buttons && !s.mouse.movement);
+    report_fail_at = 0; reports = 0;
+    connect_peer(mouse_peer); authenticate(mouse_peer, BLE_ADDR_TYPE_PUBLIC, true);
+    CHECK(s_snapshot.state == BT_CONNECTED && !s.mouse.buttons);
+
+    // Failed mouse sends drop the drag/pattern and recreate the connection.
+    report_fail_at = reports + 1;
+    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000)); run_worker();
+    CHECK(s_snapshot.state == BT_RECONNECTING && !s.mouse.buttons && !s.mouse.movement);
+    report_fail_at = 0; reports = 0;
+    connect_peer(mouse_peer); authenticate(mouse_peer, BLE_ADDR_TYPE_PUBLIC, true);
+    CHECK(s_snapshot.state == BT_CONNECTED && !s.mouse.buttons && !s.mouse.movement && ccc_restores >= 1);
+    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000)); run_worker();
+    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_CUSTOM4, BT_MOUSE_PRESS, now / 1000)); run_worker();
+    bt_keyboard_close(); run_worker();
+    CHECK(s_snapshot.state == BT_OFF && !s.mouse.buttons && !s.mouse.movement && !last_report.data[0]);
+    CHECK(!bt_keyboard_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000));
+
+    // A link can arrive before its queued CONNECT message is processed.
+    // Closing invalidates that message; shutdown must still disconnect the link.
+    reset(false, false); open_profile(21);
+    esp_ble_gatts_cb_param_t pending_connect = {0};
+    memcpy(pending_connect.connect.remote_bda, mouse_peer, 6);
+    gatts(ESP_GATTS_CONNECT_EVT, 0, &pending_connect);
+    CHECK(!s.connected); // The worker has not consumed the callback yet.
+    bt_keyboard_close(); run_worker();
+    CHECK(link_disconnects == 1 && s_snapshot.state == BT_OFF);
+
+    // The same race during Pair new must disconnect before stack-only Unpair.
+    reset(false, false); open_profile(22);
+    gatts(ESP_GATTS_CONNECT_EVT, 0, &pending_connect);
+    CHECK(bt_keyboard_forget(22, true)); run_worker();
+    CHECK(link_disconnects == 1 && s.forgetting && !s.hid && !physical_link(NULL));
+
+    // A connection may arrive while STOP_ADVERTISING is in flight too.
+    reset(false, false); open_profile(23); connect_on_stop = true;
+    bt_keyboard_close(); run_worker();
+    CHECK(link_disconnects == 1 && s_snapshot.state == BT_OFF && !physical_link(NULL));
+
+    // A missing disconnect completion must not enter synchronous SDK teardown.
+    reset(false, false); open_profile(24);
+    gatts(ESP_GATTS_CONNECT_EVT, 0, &pending_connect); hold_disconnect = true;
+    bt_keyboard_close(); run_worker();
+    CHECK(s_snapshot.state == BT_ERROR && s_snapshot.error == ESP_ERR_TIMEOUT);
+    CHECK(s.hid && s.host_on && !deinit_calls && !controller_deinits);
+    hold_disconnect = false;
+    open_profile(25);
+    CHECK(s_snapshot.state == BT_PAIRING && !physical_link(NULL));
 
     printf("PASS: %u Bluetooth worker checks (mock stack; hardware validation still required).\n", checks);
     return 0;

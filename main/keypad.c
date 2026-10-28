@@ -123,6 +123,11 @@ static ui_event_type_t map_key_to_ui_long(int key)
         case KEYPAD_BACK: return UI_EV_BACK_LONG;
         case REMOTE_KEY_HOME: return UI_EV_HOME_LONG;
         case REMOTE_KEY_POWER: return UI_EV_POWER_LONG;
+        case REMOTE_KEY_UP:
+        case REMOTE_KEY_DOWN:
+        case REMOTE_KEY_LEFT:
+        case REMOTE_KEY_RIGHT:
+        case REMOTE_KEY_CUSTOM4: return UI_EV_KEY_LONG;
         default:         return UI_EV_NONE;
     }
 }

@@ -28,6 +28,9 @@ typedef enum { BT_REMOTE_KEYBOARD = 0, BT_REMOTE_MOUSE, BT_REMOTE_CONTROLLER } b
 typedef enum { BT_BOND_STORE_LEGACY = 0, BT_BOND_STORE_PROFILE = 1 } bt_bond_store_t;
 
 typedef enum { BT_PRESET_FIRE_TV = 0, BT_PRESET_MEDIA, BT_PRESET_TEXT, BT_PRESET_CUSTOM } bt_preset_t;
+typedef enum { BT_MOUSE_MAPPED = 0, BT_MOUSE_PATTERNS } bt_mouse_mode_t;
+#define BT_MOUSE_SPEED_DEFAULT 5
+#define BT_MOUSE_SPEED_MAX 10
 typedef struct { uint8_t keycode; uint8_t modifiers; } bt_binding_t;
 typedef struct { uint16_t addr; uint16_t cmd; } ir_nec_code_t;
 typedef struct {
@@ -47,6 +50,8 @@ typedef struct {
             uint8_t preset; // Zero keeps existing profiles on the Fire TV preset.
             bt_binding_t bindings[REMOTE_KEY_COUNT];
             uint8_t bond_store; // Versioned backend: legacy shared store or per-identity store.
+            uint8_t mouse_mode;
+            uint8_t mouse_speed; // 1..10; zero from older profiles uses the default.
         } bt;
     };
 } remote_t;
