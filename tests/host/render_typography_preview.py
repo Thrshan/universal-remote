@@ -14,13 +14,23 @@ for name in fonts:
     extracted.append(fonts_source[start:end])
 (work / "fonts.c").write_text('\n'.join(extracted))
 sources = [
-    'tests/host/typography_preview.c', 'tests/host/host_support.c', 'tests/host/bt_fake.c', 'main/app_state.c', 'main/bt_keymap.c', 'main/bt_output.c',
-    'components/ui/ui_nav.c', 'components/ui/ui_screens.c', 'components/ui/ui_icons.c',
+    'tests/host/typography_preview.c', 'tests/host/host_support.c', 'tests/host/bt_fake.c',
+    'components/app_core/app_state.c', 'components/app_core/remote_model.c',
+    'components/app_core/app_storage.c', 'components/app_core/profiles/bt_keymap.c',
+    'components/app_core/profiles/bt_mouse.c', 'components/app_core/profiles/bt_output.c',
+    'components/ui/ui_nav.c', 'components/ui/ui_screens.c',
+    'components/ui/ui_icons.c', 'components/ui/ui_common.c',
+    'components/ui/screens/ui_home.c', 'components/ui/screens/ui_settings.c',
+    'components/ui/screens/ui_remote.c', 'components/ui/screens/ui_edit.c',
+    'components/ui/screens/ui_wizard.c', 'components/ui/screens/ui_bluetooth.c',
+    'components/ui/screens/ui_ir.c',
     'build_host/typography/fonts.c',
 ] + [str(path) for path in (root / 'managed_components/u8g2/csrc').glob('*.c')
      if path.name != 'u8g2_fonts.c']
 args = ['gcc', '-std=c11', '-O0', '-ffunction-sections', '-fdata-sections',
-        '-Itests/host/include', '-Itests/host', '-Imain', '-Icomponents/ui/include',
+        '-Itests/host/include', '-Itests/host',
+        '-Icomponents/app_core', '-Icomponents/app_core/profiles', '-Icomponents/bluetooth',
+        '-Imain/drivers', '-Icomponents/ui/include', '-Icomponents/ui',
         '-Imanaged_components/u8g2/csrc'] + sources + ['-Wl,--gc-sections', '-o', 'build_host/typography/preview.exe']
 subprocess.run(args, cwd=root, check=True)
 subprocess.run([str(work / 'preview.exe')], cwd=root, check=True)

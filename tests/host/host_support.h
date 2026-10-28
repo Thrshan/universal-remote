@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
-#include "bt_keyboard.h"
+#include "bt_runtime.h"
+#include "app_state.h"
 extern uint32_t host_time;
 extern int host_fail_save;
 extern int host_fail_stats;

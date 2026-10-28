@@ -1,5 +1,9 @@
 # Bluetooth mouse remotes
 
+The [user guide](user-guide.md#mouse-controls) also covers every setup page and
+shared navigation rule; the [developer guide](developer-guide.md#output) explains
+the mouse state machine and output/cancellation contracts.
+
 ![Mouse screens rendered by the firmware](bluetooth-mouse-preview.png)
 
 Choose **Add remote > BT > Mouse**, enter a name, pick an icon, then select

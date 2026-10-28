@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../../../main/bt_keyboard.c"
+#include "../../../components/bluetooth/bt_runtime.c"
 
 static unsigned checks;
 #define CHECK(value) do { ++checks; if (!(value)) { fprintf(stderr, "Failed line %d: %s\n", __LINE__, #value); abort(); } } while (0)
@@ -267,10 +267,10 @@ static void reset(bool bonded, bool private_peer)
     link_disconnects = 0;
     hold_disconnect = connect_on_stop = false;
     memset(local_address, 0, 6);
-    bt_keyboard_init();
+    bt_runtime_init();
 }
 static void open_profile(uint32_t session)
-{ CHECK(bt_keyboard_open(&profiles[0], 0, session)); run_worker(); }
+{ CHECK(bt_runtime_open(&profiles[0], 0, session)); run_worker(); }
 static void authenticate(const uint8_t *peer, esp_ble_addr_type_t type, bool success)
 {
     esp_ble_gap_cb_param_t param = {0};
@@ -321,7 +321,7 @@ int main(void)
     // Every reopen restores privacy, preserves the local identity and ignores old queued generations.
     for (unsigned i = 0; i < 3; ++i) {
         uint32_t old_generation = s.generation;
-        bt_keyboard_close(); run_worker();
+        bt_runtime_close(); run_worker();
         CHECK(s_snapshot.state == BT_OFF && !s.privacy_ready && !s.host_on);
         hold_mode = true;
         open_profile(i + 2);
@@ -382,7 +382,7 @@ int main(void)
     authenticate(bonds[0].bd_addr, BLE_ADDR_TYPE_RANDOM, true);
     CHECK(s_snapshot.state == BT_CONNECTED);
     // Explicit forgetting must remove the database entry, not an identity alias.
-    CHECK(bt_keyboard_forget(1, false)); run_worker();
+    CHECK(bt_runtime_forget(1, false)); run_worker();
     CHECK(removes == 1 && memcmp(removed, profiles[0].bt.peer, 6) != 0);
     CHECK(adv_calls == 1 && hid_init_calls == 1 && s.forgetting);
 
@@ -418,7 +418,7 @@ int main(void)
     authenticate(bonds[0].bd_addr, BLE_ADDR_TYPE_PUBLIC, true);
     CHECK(s.awaiting_save && !s.saved && !reports && saved_events == 1);
     profiles[0].bt.bonded = 1;
-    bt_keyboard_peer_saved(1, true, &profiles[0]); run_worker();
+    bt_runtime_peer_saved(1, true, &profiles[0]); run_worker();
     CHECK(s_snapshot.state == BT_CONNECTED && reports == 0);
     authenticate(bonds[0].bd_addr, BLE_ADDR_TYPE_PUBLIC, true);
     CHECK(s_snapshot.state == BT_CONNECTED && saved_events == 1);
@@ -434,11 +434,11 @@ int main(void)
     memcpy(profiles[1].bt.peer, bonds[0].bond_key.pid_key.static_addr, 6);
     profiles[1].bt.addr_type = BLE_ADDR_TYPE_PUBLIC;
     open_profile(1);
-    CHECK(bt_keyboard_forget(1, true)); run_worker();
+    CHECK(bt_runtime_forget(1, true)); run_worker();
     CHECK(!removes && saved_events == 1 && !saved_event.bt.bonded);
     profiles[0].bt.bonded = 0;
     profiles[0].bt.bond_store = BT_BOND_STORE_PROFILE;
-    bt_keyboard_peer_saved(1, true, &profiles[0]); run_worker();
+    bt_runtime_peer_saved(1, true, &profiles[0]); run_worker();
     CHECK(s_snapshot.state == BT_PAIRING && !s.saved && !removes);
     CHECK(memcmp(local_address, profiles[0].bt.local_addr, 6) == 0);
 
@@ -453,7 +453,7 @@ int main(void)
     reset(true, false);
     remote_t profile_a = profiles[0];
     uint8_t host_address[6]; memcpy(host_address, bonds[0].bd_addr, 6);
-    open_profile(1); bt_keyboard_close(); run_worker();
+    open_profile(1); bt_runtime_close(); run_worker();
     profile_count = 2; profiles[1] = profile_a;
     profiles[0].bt.local_addr[5] ^= 1;
     profiles[0].bt.bonded = 0;
@@ -466,20 +466,20 @@ int main(void)
     profiles[0].bt.bonded = 1;
     profiles[0].bt.addr_type = saved_event.bt.addr_type;
     memcpy(profiles[0].bt.peer, saved_event.bt.peer, 6);
-    bt_keyboard_peer_saved(2, true, &profiles[0]); run_worker();
+    bt_runtime_peer_saved(2, true, &profiles[0]); run_worker();
     CHECK(s_snapshot.state == BT_CONNECTED && stores[0].count == 1 && stores[1].count == 1);
     uint8_t stable_address[6]; memcpy(stable_address, local_address, 6);
     unsigned advertisements = adv_calls, services = hid_init_calls;
-    CHECK(bt_keyboard_forget(2, true)); run_worker();
+    CHECK(bt_runtime_forget(2, true)); run_worker();
     CHECK(removes == 1 && stores[1].count == 0 && stores[0].count == 1);
     CHECK(adv_calls == advertisements && hid_init_calls == services && s.forgetting);
     profiles[0].bt.bonded = 0;
-    bt_keyboard_peer_saved(2, true, &profiles[0]); run_worker();
+    bt_runtime_peer_saved(2, true, &profiles[0]); run_worker();
     CHECK(adv_calls == advertisements + 1 && active_store == &stores[1]);
     CHECK(memcmp(local_address, stable_address, 6) == 0);
-    bt_keyboard_close(); run_worker();
+    bt_runtime_close(); run_worker();
     strcpy(profiles[1].name, "Renamed");
-    CHECK(bt_keyboard_open(&profiles[1], 1, 3)); run_worker();
+    CHECK(bt_runtime_open(&profiles[1], 1, 3)); run_worker();
     CHECK(active_store == &stores[0] && s_snapshot.state == BT_RECONNECTING);
     CHECK(memcmp(local_address, profile_a.bt.local_addr, 6) == 0 && stores[0].count == 1);
 
@@ -495,7 +495,7 @@ int main(void)
     CHECK(s.subscribed && s_snapshot.state == BT_CONNECTED && ccc_saves == 2 && !reports);
     callback_message((message_t){.type = MSG_WRITE}); run_worker();
     CHECK(ccc_saves == 2); // LED/control writes must not cause flash wear.
-    bt_keyboard_close(); run_worker();
+    bt_runtime_close(); run_worker();
     hid_ccc.reports[0].value = 0; // Newly allocated HID instance.
     open_profile(2);
     CHECK(ccc_restores == 1 && hid_ccc.reports[0].value == 1 && !s.encrypted && !s.subscribed);
@@ -507,53 +507,53 @@ int main(void)
     hid_ccc.reports[0].value = 0;
     callback_message((message_t){.type = MSG_WRITE}); run_worker();
     CHECK(!s.subscribed && stored_ccc.reports[0].value == 0 && ccc_saves == 3);
-    CHECK(bt_keyboard_forget(2, true)); run_worker();
+    CHECK(bt_runtime_forget(2, true)); run_worker();
     CHECK(ccc_forgets == 1 && !has_ccc);
 
     // Mouse uses the same authenticated, durable, subscribed connection path.
     reset(false, false);
     profiles[0].bt.kind = BT_REMOTE_MOUSE; profiles[0].bt.mouse_mode = BT_MOUSE_PATTERNS;
     open_profile(11);
-    CHECK(!bt_keyboard_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_PRESS, 0));
+    CHECK(!bt_runtime_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_PRESS, 0));
     uint8_t mouse_peer[6] = {0x23,0,0,0,0,0x45};
     connect_peer(mouse_peer); authenticate(mouse_peer, BLE_ADDR_TYPE_PUBLIC, true);
-    CHECK(!bt_keyboard_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, 0) && !reports);
+    CHECK(!bt_runtime_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, 0) && !reports);
     profiles[0] = s.profile;
-    bt_keyboard_peer_saved(11, true, &profiles[0]); run_worker();
+    bt_runtime_peer_saved(11, true, &profiles[0]); run_worker();
     CHECK(s_snapshot.state == BT_CONNECTED);
-    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, 0)); run_worker();
+    CHECK(bt_runtime_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, 0)); run_worker();
     CHECK(last_report.length == 5 && last_report.data[0] == 1 && s_snapshot.mouse_buttons == 1);
-    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_PRESS, 0)); run_worker();
+    CHECK(bt_runtime_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_PRESS, 0)); run_worker();
     CHECK(last_report.data[0] == 1 && last_report.data[1] == 10);
-    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_RELEASE, 100)); run_worker();
+    CHECK(bt_runtime_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_RELEASE, 100)); run_worker();
     now += 20000; run_worker(); CHECK(last_report.data[1] == 10 && s.mouse.movement == REMOTE_KEY_RIGHT);
     profiles[0].bt.mouse_speed = 9;
     now += 20000; run_worker(); CHECK(last_report.data[1] == 18); // Live saved-speed update.
     unsigned before_reports = reports;
     now += 1000000; run_worker(); CHECK(reports == before_reports + 1); // No catch-up burst.
-    bt_keyboard_release(11); run_worker();
+    bt_runtime_release(11); run_worker();
     CHECK(!s.mouse.movement && !s.mouse.buttons && !last_report.data[0] && !s_snapshot.mouse_buttons);
     now += 20000; before_reports = reports; run_worker(); CHECK(reports == before_reports);
 
     // Queued old input and a lost release message cannot restart movement.
-    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_CUSTOM4, BT_MOUSE_PRESS, now / 1000));
-    bt_keyboard_release(11); run_worker(); CHECK(!s.mouse.movement);
-    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_PRESS, now / 1000)); run_worker();
+    CHECK(bt_runtime_mouse_input(11, REMOTE_KEY_CUSTOM4, BT_MOUSE_PRESS, now / 1000));
+    bt_runtime_release(11); run_worker(); CHECK(!s.mouse.movement);
+    CHECK(bt_runtime_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_PRESS, now / 1000)); run_worker();
     queue_full = true;
-    CHECK(!bt_keyboard_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_RELEASE, now / 1000));
+    CHECK(!bt_runtime_mouse_input(11, REMOTE_KEY_RIGHT, BT_MOUSE_RELEASE, now / 1000));
     queue_full = false; run_worker(); CHECK(!s.mouse.movement && !s.mouse.buttons);
 
-    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000)); run_worker();
-    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_UP, BT_MOUSE_PRESS, now / 1000)); run_worker();
+    CHECK(bt_runtime_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000)); run_worker();
+    CHECK(bt_runtime_mouse_input(11, REMOTE_KEY_UP, BT_MOUSE_PRESS, now / 1000)); run_worker();
     callback_message((message_t){.type = MSG_SUSPEND, .flag = true}); run_worker();
     CHECK(s_snapshot.state == BT_SUSPENDED && !s.mouse.movement && !s.mouse.buttons);
     before_reports = reports; now += 100000; run_worker(); CHECK(reports == before_reports);
     callback_message((message_t){.type = MSG_SUSPEND, .flag = false}); run_worker();
     CHECK(s_snapshot.state == BT_CONNECTED && !s.mouse.movement);
 
-    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000)); run_worker();
+    CHECK(bt_runtime_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000)); run_worker();
     report_fail_at = reports + 1;
-    bt_keyboard_release(11); run_worker();
+    bt_runtime_release(11); run_worker();
     CHECK(s_snapshot.state == BT_RECONNECTING && !s.mouse.buttons && !s.mouse.movement);
     report_fail_at = 0; reports = 0;
     connect_peer(mouse_peer); authenticate(mouse_peer, BLE_ADDR_TYPE_PUBLIC, true);
@@ -561,16 +561,16 @@ int main(void)
 
     // Failed mouse sends drop the drag/pattern and recreate the connection.
     report_fail_at = reports + 1;
-    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000)); run_worker();
+    CHECK(bt_runtime_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000)); run_worker();
     CHECK(s_snapshot.state == BT_RECONNECTING && !s.mouse.buttons && !s.mouse.movement);
     report_fail_at = 0; reports = 0;
     connect_peer(mouse_peer); authenticate(mouse_peer, BLE_ADDR_TYPE_PUBLIC, true);
     CHECK(s_snapshot.state == BT_CONNECTED && !s.mouse.buttons && !s.mouse.movement && ccc_restores >= 1);
-    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000)); run_worker();
-    CHECK(bt_keyboard_mouse_input(11, REMOTE_KEY_CUSTOM4, BT_MOUSE_PRESS, now / 1000)); run_worker();
-    bt_keyboard_close(); run_worker();
+    CHECK(bt_runtime_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000)); run_worker();
+    CHECK(bt_runtime_mouse_input(11, REMOTE_KEY_CUSTOM4, BT_MOUSE_PRESS, now / 1000)); run_worker();
+    bt_runtime_close(); run_worker();
     CHECK(s_snapshot.state == BT_OFF && !s.mouse.buttons && !s.mouse.movement && !last_report.data[0]);
-    CHECK(!bt_keyboard_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000));
+    CHECK(!bt_runtime_mouse_input(11, REMOTE_KEY_OK, BT_MOUSE_PRESS, now / 1000));
 
     // A link can arrive before its queued CONNECT message is processed.
     // Closing invalidates that message; shutdown must still disconnect the link.
@@ -579,24 +579,24 @@ int main(void)
     memcpy(pending_connect.connect.remote_bda, mouse_peer, 6);
     gatts(ESP_GATTS_CONNECT_EVT, 0, &pending_connect);
     CHECK(!s.connected); // The worker has not consumed the callback yet.
-    bt_keyboard_close(); run_worker();
+    bt_runtime_close(); run_worker();
     CHECK(link_disconnects == 1 && s_snapshot.state == BT_OFF);
 
     // The same race during Pair new must disconnect before stack-only Unpair.
     reset(false, false); open_profile(22);
     gatts(ESP_GATTS_CONNECT_EVT, 0, &pending_connect);
-    CHECK(bt_keyboard_forget(22, true)); run_worker();
+    CHECK(bt_runtime_forget(22, true)); run_worker();
     CHECK(link_disconnects == 1 && s.forgetting && !s.hid && !physical_link(NULL));
 
     // A connection may arrive while STOP_ADVERTISING is in flight too.
     reset(false, false); open_profile(23); connect_on_stop = true;
-    bt_keyboard_close(); run_worker();
+    bt_runtime_close(); run_worker();
     CHECK(link_disconnects == 1 && s_snapshot.state == BT_OFF && !physical_link(NULL));
 
     // A missing disconnect completion must not enter synchronous SDK teardown.
     reset(false, false); open_profile(24);
     gatts(ESP_GATTS_CONNECT_EVT, 0, &pending_connect); hold_disconnect = true;
-    bt_keyboard_close(); run_worker();
+    bt_runtime_close(); run_worker();
     CHECK(s_snapshot.state == BT_ERROR && s_snapshot.error == ESP_ERR_TIMEOUT);
     CHECK(s.hid && s.host_on && !deinit_calls && !controller_deinits);
     hold_disconnect = false;

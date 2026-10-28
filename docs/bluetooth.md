@@ -1,5 +1,9 @@
 # Bluetooth remotes
 
+For the full operating manual and exact per-page controls, see the
+[user guide](user-guide.md). For task ownership and state-machine contracts,
+see the [developer guide](developer-guide.md#bluetooth).
+
 Keyboard and mouse remotes share the connection menu, pairing, reconnection,
 Unpair and profile storage described here. See [mouse controls and patterns](bluetooth-mouse.md)
 for mouse setup, fixed mappings and saved movement speed.
@@ -168,7 +172,7 @@ be checked on the Fire TV.
 
 ## Implementation and verification
 
-`main/bt_keyboard.c` owns Bluetooth on one worker task. The UI requests sessions,
+`components/bluetooth/bt_runtime.c` owns Bluetooth on one worker task. The UI requests sessions,
 reads status snapshots, and commits peer identities to the existing profile
 store. Callback generations/session IDs reject stale events. Connected status
 requires successful encryption, durable peer storage, and a subscribed keyboard

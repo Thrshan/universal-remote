@@ -507,7 +507,7 @@ static int settings_checks(ui_ctx_t *ctx)
 }
 int main(void)
 {
-    bt_keyboard_init();
+    bt_runtime_init();
     CHECK(bt_configure_advertising(0x03C1) == ESP_OK);
     CHECK(host_adv_calls == 2 && host_adv_service == 0x1812 && host_adv_appearance == 0x03C1);
     CHECK(!host_adv_has_name && host_scan_has_name);
