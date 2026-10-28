@@ -18,6 +18,10 @@ typedef struct ui_ctx {
     int back_target_top; // Parent of the screen where an IR BACK hold began.
     uint32_t splash_started;
     unsigned home_sel;
+    unsigned settings_sel;
+    app_storage_usage_t storage_usage;
+    esp_err_t storage_status;
+    bool storage_pending;
     unsigned active_remote;
     unsigned menu_sel;
     unsigned type_sel;

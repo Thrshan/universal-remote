@@ -47,4 +47,10 @@ selected = [names[i] for i in (2, 3, 5, 6, 9, 10, 11, 14)]
 sheet(selected, 4, root / "docs" / "ui-preview.png")
 sheet([names[i] for i in (18, 14, 20, 19, 21, 22)], 3, root / "docs" / "bluetooth-preview.png")
 sheet(names[23:], 4, root / "docs" / "bluetooth-presets-preview.png")
+sheet([
+    ("37-settings", "Device settings"), ("38-about", "Product and firmware"),
+    ("41-storage-used", "Storage used / free"), ("39-storage-loading", "Measure after opening"),
+    ("40-storage-empty", "Empty storage"), ("42-storage-full", "No free space"),
+    ("43-storage-error", "Read error / retry"),
+], 4, root / "docs" / "settings-preview.png")
 print(root / "docs" / "ui-preview.png")

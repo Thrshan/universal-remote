@@ -31,3 +31,15 @@ static const char *const names[REMOTE_ICON_COUNT] = {"TV","Soundbar","Speaker","
 const char *ui_icon_name(unsigned icon) { return names[icon % REMOTE_ICON_COUNT]; }
 void ui_draw_icon(u8g2_t *display, int x, int y, unsigned icon)
 { u8g2_DrawXBM(display, x, y, 16, 16, icons[icon % REMOTE_ICON_COUNT]); }
+void ui_draw_product_logo(u8g2_t *display, int x, int y)
+{
+    // A 32 x 32 monochrome remote with outgoing signal waves.
+    u8g2_DrawCircle(display, x + 16, y + 9, 8, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
+    u8g2_DrawCircle(display, x + 16, y + 9, 5, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
+    u8g2_DrawRFrame(display, x + 8, y + 9, 17, 23, 3);
+    u8g2_DrawCircle(display, x + 16, y + 14, 2, U8G2_DRAW_ALL);
+    u8g2_DrawHLine(display, x + 13, y + 22, 7);
+    u8g2_DrawVLine(display, x + 16, y + 19, 7);
+    u8g2_DrawBox(display, x + 12, y + 28, 2, 2);
+    u8g2_DrawBox(display, x + 19, y + 28, 2, 2);
+}
