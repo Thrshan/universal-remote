@@ -122,6 +122,7 @@ static ui_event_type_t map_key_to_ui_long(int key)
         case KEYPAD_OK:   return UI_EV_OK_LONG;
         case KEYPAD_BACK: return UI_EV_BACK_LONG;
         case REMOTE_KEY_HOME: return UI_EV_HOME_LONG;
+        case REMOTE_KEY_POWER: return UI_EV_POWER_LONG;
         default:         return UI_EV_NONE;
     }
 }
@@ -273,6 +274,7 @@ static void keypad_task(void *arg)
             if (current_key != last_key) {
                 if (last_key != 0) {
                     ESP_LOGI(TAG, "release event, key = %d", last_key);
+                    emit_ui(ui_q, UI_EV_KEY_RELEASE, last_key, false);
                 }
                 if (current_key != 0) {
                     ESP_LOGI(TAG, "press event, key = %d", current_key);

@@ -55,7 +55,9 @@ power switch for the ESP32.
 The scanner debounces using five matching samples, reports one contact at a
 time, and ignores the node 7/8 contact. Arrow, volume up/down and channel up/down
 keys repeat after 350 ms, then every 120 ms (subject to scan timing).
-OK/BACK/HOME generate long events after 700 ms. Repeat events never select a
+OK/BACK/HOME/POWER generate long events after 700 ms. The scanner also reports
+key releases. BT sends short Power on release and reserves a Power hold for
+Ctrl+Alt+Delete; IR retains its immediate Power behavior. Repeat events never select a
 new IR learning target.
 
 ## Hardware check

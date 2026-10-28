@@ -6,11 +6,15 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "bt_keymap.h"
+#include "esp_random.h"
 
 static app_ctx_t s_app;
 static const char *TAG = "app_state";
 #define STORE_MAGIC 0x554E4952u
-#define STORE_VERSION 1
+#define STORE_VERSION 3
+_Static_assert(sizeof(remote_t) == 104 && offsetof(remote_t, keys) == 20,
+               "Version-1 remote profiles must retain their on-flash layout");
 
 typedef struct {
     uint32_t magic;
@@ -41,11 +45,32 @@ const char *remote_transport_name(unsigned transport)
 }
 bool remote_key_assignable(unsigned key)
 { return key >= 1 && key <= REMOTE_KEY_COUNT && key != REMOTE_KEY_MODE; }
+bool remote_bt_has_identity(const remote_t *remote)
+{
+    const uint8_t *addr = remote->bt.local_addr;
+    if ((addr[0] & 0xC0) != 0xC0) return false;
+    bool all_zero = (addr[0] & 0x3F) == 0, all_one = (addr[0] & 0x3F) == 0x3F;
+    for (unsigned i = 1; i < 6; ++i) {
+        all_zero &= addr[i] == 0;
+        all_one &= addr[i] == 0xFF;
+    }
+    return !all_zero && !all_one;
+}
+void remote_bt_ensure_identity(remote_t *remote)
+{
+    if (remote_bt_has_identity(remote)) return;
+    do {
+        esp_fill_random(remote->bt.local_addr, 6);
+        remote->bt.local_addr[0] |= 0xC0;
+    } while (!remote_bt_has_identity(remote));
+}
 unsigned remote_assigned_count(const remote_t *remote)
 {
     unsigned count = 0;
+    uint32_t assigned = remote->transport == REMOTE_BT && remote->bt.kind == BT_REMOTE_KEYBOARD
+        ? bt_profile_mask(remote) : remote->assigned;
     for (unsigned key = 1; key <= REMOTE_KEY_COUNT; ++key)
-        if (remote_key_assignable(key) && (remote->assigned & (1u << (key - 1)))) ++count;
+        if (remote_key_assignable(key) && (assigned & (1u << (key - 1)))) ++count;
     return count;
 }
 void app_post_evt(const app_evt_t *event)
@@ -70,36 +95,63 @@ bool app_remote_get(unsigned index, remote_t *remote)
     xSemaphoreGive(s_app.model_mutex);
     return valid;
 }
-static uint32_t checksum(const remote_blob_t *blob)
+static uint32_t checksum(const remote_blob_t *blob, size_t size)
 {
     const uint8_t *bytes = (const uint8_t *)blob;
     uint32_t hash = 2166136261u;
-    for (size_t i = 0; i < offsetof(remote_blob_t, checksum); ++i)
-        hash = (hash ^ bytes[i]) * 16777619u;
+    for (size_t i = 0; i < size; ++i)
+        if (i < offsetof(remote_blob_t, checksum) || i >= sizeof(*blob))
+            hash = (hash ^ bytes[i]) * 16777619u;
     return hash;
 }
 static bool valid_remote(const remote_t *remote)
 {
     const uint32_t allowed = ((1u << REMOTE_KEY_COUNT) - 1u) & ~(1u << (REMOTE_KEY_MODE - 1));
+    if (remote->transport == REMOTE_BT) {
+        if (remote->bt.preset > BT_PRESET_CUSTOM || remote->bt.bond_store > BT_BOND_STORE_PROFILE) return false;
+        if (remote->bt.preset == BT_PRESET_CUSTOM)
+            for (unsigned i = 0; i < REMOTE_KEY_COUNT; ++i)
+                if (!bt_binding_valid(remote->bt.bindings[i])
+                    || (i == REMOTE_KEY_MODE - 1 && remote->bt.bindings[i].keycode)) return false;
+    }
     return remote->name[0] && memchr(remote->name, 0, sizeof(remote->name))
         && remote->transport <= REMOTE_WIFI && remote->icon < REMOTE_ICON_COUNT
-        && !(remote->assigned & ~allowed);
+        && !(remote->assigned & ~allowed)
+        && (remote->transport != REMOTE_BT || (remote->bt.kind <= BT_REMOTE_CONTROLLER
+            && remote->bt.bonded <= 1 && remote->bt.addr_type <= 3));
 }
 static esp_err_t save_remotes(void)
 {
-    remote_blob_t *blob = calloc(1, sizeof(*blob));
+    // Append only nonempty strings to the checksummed profile snapshot. Names,
+    // mappings, text and peer metadata are committed as one NVS value.
+    size_t size = sizeof(remote_blob_t);
+    for (unsigned i = 0; i < s_app.remote_count; ++i)
+        if (s_app.remotes[i].transport == REMOTE_BT && s_app.remotes[i].bt.preset == BT_PRESET_TEXT)
+            for (unsigned key = 0; key < REMOTE_KEY_COUNT; ++key)
+                if (s_app.bt_text[i][key][0]) size += 3 + strlen(s_app.bt_text[i][key]);
+    remote_blob_t *blob = calloc(1, size);
     if (!blob) return ESP_ERR_NO_MEM;
     blob->magic = STORE_MAGIC;
     blob->version = STORE_VERSION;
     xSemaphoreTake(s_app.model_mutex, portMAX_DELAY);
     blob->count = s_app.remote_count;
     memcpy(blob->remotes, s_app.remotes, sizeof(blob->remotes));
+    uint8_t *text = (uint8_t *)(blob + 1);
+    for (unsigned i = 0; i < s_app.remote_count; ++i)
+        if (s_app.remotes[i].transport == REMOTE_BT && s_app.remotes[i].bt.preset == BT_PRESET_TEXT)
+            for (unsigned key = 0; key < REMOTE_KEY_COUNT; ++key) {
+                size_t length = strlen(s_app.bt_text[i][key]);
+                if (!length) continue;
+                *text++ = i; *text++ = key; *text++ = length;
+                memcpy(text, s_app.bt_text[i][key], length);
+                text += length;
+            }
     xSemaphoreGive(s_app.model_mutex);
-    blob->checksum = checksum(blob);
+    blob->checksum = checksum(blob, size);
     nvs_handle_t handle;
     esp_err_t err = nvs_open("remotes", NVS_READWRITE, &handle);
     if (err == ESP_OK) {
-        err = nvs_set_blob(handle, "profiles", blob, sizeof(*blob));
+        err = nvs_set_blob(handle, "profiles", blob, size);
         if (err == ESP_OK) err = nvs_commit(handle);
         nvs_close(handle);
     }
@@ -117,6 +169,7 @@ esp_err_t app_remote_create(const remote_t *remote, unsigned *index)
     if (count >= MAX_REMOTES) return ESP_ERR_NO_MEM;
     xSemaphoreTake(s_app.model_mutex, portMAX_DELAY);
     s_app.remotes[count] = *remote;
+    memset(s_app.bt_text[count], 0, sizeof(s_app.bt_text[count]));
     s_app.remote_count++;
     xSemaphoreGive(s_app.model_mutex);
     esp_err_t err = save_remotes();
@@ -150,16 +203,22 @@ esp_err_t app_remote_remove(unsigned index)
     if (s_app.storage_error != ESP_OK) return s_app.storage_error;
     remote_t previous;
     if (!app_remote_get(index, &previous)) return ESP_ERR_INVALID_ARG;
+    char previous_text[REMOTE_KEY_COUNT][BT_TEXT_MAX + 1];
+    memcpy(previous_text, s_app.bt_text[index], sizeof(previous_text));
     xSemaphoreTake(s_app.model_mutex, portMAX_DELAY);
     unsigned count = --s_app.remote_count;
     memmove(&s_app.remotes[index], &s_app.remotes[index + 1], (count - index) * sizeof(remote_t));
     memset(&s_app.remotes[count], 0, sizeof(remote_t));
+    memmove(&s_app.bt_text[index], &s_app.bt_text[index + 1], (count - index) * sizeof(s_app.bt_text[0]));
+    memset(&s_app.bt_text[count], 0, sizeof(s_app.bt_text[0]));
     xSemaphoreGive(s_app.model_mutex);
     esp_err_t err = save_remotes();
     if (err != ESP_OK) {
         xSemaphoreTake(s_app.model_mutex, portMAX_DELAY);
         memmove(&s_app.remotes[index + 1], &s_app.remotes[index], (count - index) * sizeof(remote_t));
         s_app.remotes[index] = previous;
+        memmove(&s_app.bt_text[index + 1], &s_app.bt_text[index], (count - index) * sizeof(s_app.bt_text[0]));
+        memcpy(s_app.bt_text[index], previous_text, sizeof(previous_text));
         s_app.remote_count++;
         xSemaphoreGive(s_app.model_mutex);
     }
@@ -173,6 +232,45 @@ esp_err_t app_remote_set_code(unsigned index, unsigned key, ir_nec_code_t code)
     remote.keys[key - 1] = code;
     remote.assigned |= 1u << (key - 1);
     return app_remote_update(index, &remote);
+}
+esp_err_t app_remote_set_bt_binding(unsigned index, unsigned key, bt_binding_t binding)
+{
+    remote_t remote;
+    if (!remote_key_assignable(key) || !bt_binding_valid(binding) || !app_remote_get(index, &remote)
+        || remote.transport != REMOTE_BT || remote.bt.preset != BT_PRESET_CUSTOM) return ESP_ERR_INVALID_ARG;
+    remote.bt.bindings[key - 1] = binding;
+    remote.assigned = bt_profile_mask(&remote);
+    return app_remote_update(index, &remote);
+}
+bool app_remote_get_bt_text(unsigned index, unsigned key, char text[BT_TEXT_MAX + 1])
+{
+    if (!remote_key_assignable(key)) return false;
+    xSemaphoreTake(s_app.model_mutex, portMAX_DELAY);
+    bool valid = index < s_app.remote_count && s_app.remotes[index].transport == REMOTE_BT
+        && s_app.remotes[index].bt.preset == BT_PRESET_TEXT;
+    if (valid) memcpy(text, s_app.bt_text[index][key - 1], BT_TEXT_MAX + 1);
+    xSemaphoreGive(s_app.model_mutex);
+    return valid;
+}
+esp_err_t app_remote_set_bt_text(unsigned index, unsigned key, const char *text)
+{
+    remote_t remote;
+    if (!remote_key_assignable(key) || !bt_text_valid(text) || !app_remote_get(index, &remote)
+        || remote.transport != REMOTE_BT || remote.bt.preset != BT_PRESET_TEXT) return ESP_ERR_INVALID_ARG;
+    char previous[BT_TEXT_MAX + 1];
+    xSemaphoreTake(s_app.model_mutex, portMAX_DELAY);
+    memcpy(previous, s_app.bt_text[index][key - 1], sizeof(previous));
+    snprintf(s_app.bt_text[index][key - 1], BT_TEXT_MAX + 1, "%s", text);
+    xSemaphoreGive(s_app.model_mutex);
+    if (text[0]) remote.assigned |= 1u << (key - 1);
+    else remote.assigned &= ~(1u << (key - 1));
+    esp_err_t err = app_remote_update(index, &remote);
+    if (err != ESP_OK) {
+        xSemaphoreTake(s_app.model_mutex, portMAX_DELAY);
+        memcpy(s_app.bt_text[index][key - 1], previous, sizeof(previous));
+        xSemaphoreGive(s_app.model_mutex);
+    }
+    return err;
 }
 static esp_err_t migrate_legacy(void)
 {
@@ -209,15 +307,46 @@ static esp_err_t load_remotes(void)
     err = nvs_open("remotes", NVS_READONLY, &handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) return migrate_legacy();
     if (err != ESP_OK) return err;
-    remote_blob_t *blob = calloc(1, sizeof(*blob));
+    size_t size = 0;
+    err = nvs_get_blob(handle, "profiles", NULL, &size);
+    if (err == ESP_ERR_NVS_NOT_FOUND) { nvs_close(handle); return migrate_legacy(); }
+    const size_t max_size = sizeof(remote_blob_t) + MAX_REMOTES * REMOTE_KEY_COUNT * (3 + BT_TEXT_MAX);
+    if (err != ESP_OK || size < sizeof(remote_blob_t) || size > max_size) {
+        nvs_close(handle); return err == ESP_OK ? ESP_ERR_INVALID_SIZE : err;
+    }
+    remote_blob_t *blob = calloc(1, size);
     if (!blob) { nvs_close(handle); return ESP_ERR_NO_MEM; }
-    size_t size = sizeof(*blob);
     err = nvs_get_blob(handle, "profiles", blob, &size);
     nvs_close(handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) { free(blob); return migrate_legacy(); }
-    if (err == ESP_OK && (size != sizeof(*blob) || blob->magic != STORE_MAGIC
-        || blob->version != STORE_VERSION || blob->count > MAX_REMOTES || blob->checksum != checksum(blob)))
+    if (err == ESP_OK && (blob->magic != STORE_MAGIC
+        || (blob->version != 1 && blob->version != 2 && blob->version != STORE_VERSION)
+        || (blob->version == 1 && size != sizeof(*blob))
+        || blob->count > MAX_REMOTES || blob->checksum != checksum(blob, size)))
         err = ESP_ERR_INVALID_STATE;
+    if (err == ESP_OK) {
+        const uint8_t *text = (const uint8_t *)(blob + 1), *end = (const uint8_t *)blob + size;
+        while (text < end && err == ESP_OK) {
+            if ((size_t)(end - text) < 3) { err = ESP_ERR_INVALID_SIZE; break; }
+            unsigned index = *text++, key = *text++, length = *text++;
+            if (index >= blob->count || key >= REMOTE_KEY_COUNT || !remote_key_assignable(key + 1)
+                || !length || length > BT_TEXT_MAX || (size_t)(end - text) < length
+                || blob->remotes[index].transport != REMOTE_BT || blob->remotes[index].bt.preset != BT_PRESET_TEXT
+                || s_app.bt_text[index][key][0] || memchr(text, 0, length)) { err = ESP_ERR_INVALID_ARG; break; }
+            memcpy(s_app.bt_text[index][key], text, length);
+            if (!bt_text_valid(s_app.bt_text[index][key])) err = ESP_ERR_INVALID_ARG;
+            text += length;
+        }
+        for (unsigned i = 0; i < blob->count && err == ESP_OK; ++i)
+            if (blob->remotes[i].transport == REMOTE_BT && blob->remotes[i].bt.preset == BT_PRESET_TEXT)
+                for (unsigned key = 1; key <= REMOTE_KEY_COUNT; ++key)
+                    if (!!(blob->remotes[i].assigned & (1u << (key - 1))) != !!s_app.bt_text[i][key - 1][0])
+                        err = ESP_ERR_INVALID_ARG;
+    }
+    if (err == ESP_OK && blob->version < 3)
+        for (unsigned i = 0; i < blob->count; ++i)
+            if (blob->remotes[i].transport == REMOTE_BT)
+                blob->remotes[i].bt.bond_store = BT_BOND_STORE_LEGACY;
     if (err == ESP_OK) {
         for (unsigned i = 0; i < blob->count; ++i)
             if (!valid_remote(&blob->remotes[i])) { err = ESP_ERR_INVALID_ARG; break; }
