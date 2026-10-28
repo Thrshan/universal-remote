@@ -1,5 +1,9 @@
 # Universal Remote UI
 
+This is the compact UI overview. Use the [complete user guide](user-guide.md)
+for every page's options, button actions, navigation flows and troubleshooting;
+use the [developer guide](developer-guide.md) for the implementation state machines.
+
 ![Actual firmware renders](ui-preview.png)
 
 ## Modes and home

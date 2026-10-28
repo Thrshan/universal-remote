@@ -1,8 +1,6 @@
-#include "ui_nav.h"
+#include "ui_internal.h"
 #include <string.h>
 #include "u8g2.h"
-
-void ui_register_screens(ui_ctx_t *ctx);
 
 void ui_nav_init(ui_ctx_t *ctx, void *display)
 {
