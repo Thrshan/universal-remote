@@ -97,6 +97,57 @@ bool app_remote_get(unsigned index, remote_t *remote)
     xSemaphoreGive(s_app.model_mutex);
     return valid;
 }
+static esp_err_t namespace_usage(const char *name, size_t *entries)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(name, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (err != ESP_OK) return err;
+    size_t used = 0;
+    err = nvs_get_used_entry_count(handle, &used);
+    nvs_close(handle);
+    if (err == ESP_OK) *entries += used + 1; // Include the namespace entry.
+    return err;
+}
+esp_err_t app_storage_get_usage(app_storage_usage_t *usage)
+{
+    if (!usage) return ESP_ERR_INVALID_ARG;
+    memset(usage, 0, sizeof(*usage));
+    nvs_stats_t stats;
+    esp_err_t err = nvs_get_stats(NULL, &stats);
+    if (err != ESP_OK) return err;
+    size_t entries = 0;
+    // Profiles, retained legacy recordings, HID subscriptions and BLE bonds
+    // share NVS. Include the allocated entries, not just the blob's payload.
+    static const char *const namespaces[] = {"remotes", "ir", "ur_hid", "bt_config.conf", "ur_public"};
+    for (unsigned i = 0; i < sizeof(namespaces) / sizeof(namespaces[0]); ++i) {
+        err = namespace_usage(namespaces[i], &entries);
+        if (err != ESP_OK) return err;
+    }
+    for (unsigned i = 0; i < app_remote_count(); ++i) {
+        remote_t remote;
+        if (!app_remote_get(i, &remote) || remote.transport != REMOTE_BT
+            || remote.bt.bond_store != BT_BOND_STORE_PROFILE || !remote_bt_has_identity(&remote)) continue;
+        bool counted = false;
+        for (unsigned j = 0; j < i; ++j) {
+            remote_t previous;
+            if (app_remote_get(j, &previous) && previous.transport == REMOTE_BT
+                && previous.bt.bond_store == BT_BOND_STORE_PROFILE
+                && memcmp(previous.bt.local_addr, remote.bt.local_addr, 6) == 0) counted = true;
+        }
+        if (counted) continue;
+        const uint8_t *a = remote.bt.local_addr;
+        char name[15];
+        snprintf(name, sizeof(name), "ur%02x%02x%02x%02x%02x%02x", a[0], a[1], a[2], a[3], a[4], a[5]);
+        err = namespace_usage(name, &entries);
+        if (err != ESP_OK) return err;
+    }
+    // NVS entries occupy 32 bytes. Available excludes NVS's reserved page and
+    // other system data, so free space is not total flash minus remote bytes.
+    usage->remote_bytes = entries * 32;
+    usage->free_bytes = stats.available_entries * 32;
+    return ESP_OK;
+}
 static uint32_t checksum(const remote_blob_t *blob, size_t size)
 {
     const uint8_t *bytes = (const uint8_t *)blob;

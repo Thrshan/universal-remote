@@ -3,6 +3,10 @@
 #include "bt_keyboard.h"
 extern uint32_t host_time;
 extern int host_fail_save;
+extern int host_fail_stats;
+extern unsigned host_stats_reads, host_namespace_reads;
+extern size_t host_available_entries;
+void host_namespace_usage(const char *name, size_t entries);
 void host_clear_storage(void);
 void host_legacy_storage(unsigned count);
 void host_corrupt_storage(void);

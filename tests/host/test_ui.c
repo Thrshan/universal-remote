@@ -395,6 +395,116 @@ static int bluetooth_mouse_checks(ui_ctx_t *ctx)
     return 0;
 }
 
+static int settings_checks(ui_ctx_t *ctx)
+{
+    host_clear_storage();
+    app_state_init();
+    ui_nav_home(ctx);
+    CHECK(host_stats_reads == 0 && host_namespace_reads == 0);
+    key(ctx, REMOTE_KEY_CUSTOM5);
+    CHECK(current(ctx) == UI_SCREEN_HOME);
+    ui_event_t repeat = {.type = UI_EV_KEY, .src = UI_SRC_KEYPAD,
+        .value = REMOTE_KEY_CUSTOM6, .repeat = true};
+    ui_nav_dispatch(ctx, &repeat);
+    CHECK(current(ctx) == UI_SCREEN_HOME);
+    key(ctx, REMOTE_KEY_CUSTOM6);
+    CHECK(current(ctx) == UI_SCREEN_SETTINGS && ctx->settings_sel == 0);
+    snapshot(ctx, "37-settings");
+    key(ctx, REMOTE_KEY_OK);
+    CHECK(current(ctx) == UI_SCREEN_ABOUT);
+    snapshot(ctx, "38-about");
+    tick(ctx, host_time + 25);
+    CHECK(host_stats_reads == 0 && host_namespace_reads == 0);
+    key(ctx, REMOTE_KEY_BACK);
+    CHECK(current(ctx) == UI_SCREEN_SETTINGS);
+    key(ctx, REMOTE_KEY_DOWN); key(ctx, REMOTE_KEY_OK);
+    CHECK(current(ctx) == UI_SCREEN_STORAGE && ctx->storage_pending);
+    tick(ctx, host_time + 25);
+    CHECK(host_stats_reads == 0); // First paint must precede the calculation.
+    snapshot(ctx, "39-storage-loading");
+    tick(ctx, host_time + 25);
+    CHECK(host_stats_reads == 1 && !ctx->storage_pending && ctx->storage_status == ESP_OK);
+    CHECK(ctx->storage_usage.remote_bytes == 0 && ctx->storage_usage.free_bytes == 16000);
+    snapshot(ctx, "40-storage-empty");
+    tick(ctx, host_time + 25); tick(ctx, host_time + 25);
+    CHECK(host_stats_reads == 1); // Redraws/ticks do not continually rescan NVS.
+    key(ctx, REMOTE_KEY_BACK);
+    CHECK(current(ctx) == UI_SCREEN_SETTINGS && ctx->settings_sel == 1);
+    key(ctx, REMOTE_KEY_BACK);
+    CHECK(current(ctx) == UI_SCREEN_HOME);
+
+    remote_t remote = {.name = "Settings TV", .transport = REMOTE_IR};
+    CHECK(app_remote_create(&remote, NULL) == ESP_OK);
+    ctx->home_sel = 0;
+    key(ctx, REMOTE_KEY_MODE);
+    CHECK(current(ctx) == UI_SCREEN_REMOTE);
+    key(ctx, REMOTE_KEY_CUSTOM6);
+    CHECK(current(ctx) == UI_SCREEN_REMOTE && ctx->last_key == REMOTE_KEY_CUSTOM6);
+    key(ctx, REMOTE_KEY_MODE); key(ctx, REMOTE_KEY_OK);
+    CHECK(current(ctx) == UI_SCREEN_EDIT);
+    key(ctx, REMOTE_KEY_CUSTOM6);
+    CHECK(current(ctx) == UI_SCREEN_EDIT);
+    key(ctx, REMOTE_KEY_HOME);
+    ctx->home_sel = 1;
+    key(ctx, REMOTE_KEY_CUSTOM6); key(ctx, REMOTE_KEY_DOWN); key(ctx, REMOTE_KEY_OK);
+    snapshot(ctx, "39-storage-loading"); tick(ctx, host_time + 25);
+    CHECK(ctx->storage_usage.remote_bytes == 1792 && ctx->storage_status == ESP_OK);
+    snapshot(ctx, "41-storage-used");
+    CHECK(host_stats_reads == 2);
+
+    // Changing the shared free count is visible only on explicit refresh.
+    host_available_entries = 0;
+    key(ctx, REMOTE_KEY_OK);
+    CHECK(ctx->storage_pending && host_stats_reads == 2);
+    ui_nav_render_if_dirty(ctx); tick(ctx, host_time + 25);
+    CHECK(ctx->storage_usage.free_bytes == 0 && host_stats_reads == 3);
+    snapshot(ctx, "42-storage-full");
+    host_fail_stats = 1;
+    key(ctx, REMOTE_KEY_OK); ui_nav_render_if_dirty(ctx); tick(ctx, host_time + 25);
+    CHECK(ctx->storage_status != ESP_OK && !ctx->storage_pending);
+    CHECK(ctx->storage_usage.remote_bytes == 0 && ctx->storage_usage.free_bytes == 0);
+    snapshot(ctx, "43-storage-error");
+    host_fail_stats = 2;
+    key(ctx, REMOTE_KEY_OK); ui_nav_render_if_dirty(ctx); tick(ctx, host_time + 25);
+    CHECK(ctx->storage_status != ESP_OK && ctx->storage_usage.free_bytes == 0);
+    host_fail_stats = 0;
+    key(ctx, REMOTE_KEY_OK); ui_nav_render_if_dirty(ctx); tick(ctx, host_time + 25);
+    CHECK(ctx->storage_status == ESP_OK);
+    key(ctx, REMOTE_KEY_HOME);
+    CHECK(current(ctx) == UI_SCREEN_HOME && ctx->home_sel == 1);
+    unsigned reads = host_stats_reads;
+    key(ctx, REMOTE_KEY_CUSTOM6); key(ctx, REMOTE_KEY_DOWN); key(ctx, REMOTE_KEY_OK);
+    key(ctx, REMOTE_KEY_HOME); tick(ctx, host_time + 25);
+    CHECK(host_stats_reads == reads); // Leaving before first paint cancels work.
+
+    app_storage_usage_t usage;
+    CHECK(app_storage_get_usage(NULL) == ESP_ERR_INVALID_ARG);
+    CHECK(app_storage_get_usage(&usage) == ESP_OK);
+    size_t base = usage.remote_bytes;
+    remote = (remote_t){.name = "Text usage", .transport = REMOTE_BT};
+    remote.bt.preset = BT_PRESET_TEXT;
+    remote.bt.bond_store = BT_BOND_STORE_PROFILE;
+    remote_bt_ensure_identity(&remote);
+    CHECK(app_remote_create(&remote, NULL) == ESP_OK);
+    CHECK(app_remote_set_bt_text(1, REMOTE_KEY_CUSTOM6, "A longer saved text string that needs multiple storage entries") == ESP_OK);
+    CHECK(app_storage_get_usage(&usage) == ESP_OK && usage.remote_bytes > base);
+    base = usage.remote_bytes;
+    host_namespace_usage("ur_hid", 3);
+    host_namespace_usage("bt_config.conf", 4);
+    host_namespace_usage("ur_public", 2);
+    host_namespace_usage("wifi", 30); // Unrelated namespace must not count as remote data.
+    char bond_namespace[15];
+    const uint8_t *a = remote.bt.local_addr;
+    snprintf(bond_namespace, sizeof(bond_namespace), "ur%02x%02x%02x%02x%02x%02x", a[0], a[1], a[2], a[3], a[4], a[5]);
+    host_namespace_usage(bond_namespace, 7);
+    CHECK(app_storage_get_usage(&usage) == ESP_OK && usage.remote_bytes == base + (4 + 5 + 3 + 8) * 32);
+    strcpy(remote.name, "Same ID");
+    CHECK(app_remote_create(&remote, NULL) == ESP_OK);
+    CHECK(app_storage_get_usage(&usage) == ESP_OK && usage.remote_bytes == base + (4 + 5 + 3 + 8) * 32);
+    host_legacy_storage(1);
+    CHECK(app_storage_get_usage(&usage) == ESP_OK && usage.remote_bytes == base + (4 + 5 + 3 + 8 + 16) * 32);
+    return 0;
+}
 int main(void)
 {
     bt_keyboard_init();
@@ -491,6 +601,7 @@ int main(void)
     CHECK(current(&ctx) == UI_SCREEN_SPLASH);
     tick(&ctx, 2000);
     CHECK(current(&ctx) == UI_SCREEN_HOME);
+    CHECK(host_stats_reads == 0 && host_namespace_reads == 0);
     snapshot(&ctx, "02-empty");
     key(&ctx, 2);
     CHECK(current(&ctx) == UI_SCREEN_HOME);
@@ -857,6 +968,7 @@ int main(void)
     CHECK(app_remote_count() == 3);
     CHECK(bluetooth_preset_checks(&ctx) == 0);
     CHECK(bluetooth_mouse_checks(&ctx) == 0);
+    CHECK(settings_checks(&ctx) == 0);
     printf("PASS: %u behavior checks; portrait screen snapshots saved in build_host.\n", checks);
     return 0;
 }

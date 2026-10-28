@@ -21,6 +21,32 @@ MODE works in the selected remote's menu/editor; wizard and learning screens
 keep their navigation behavior.
 Removal opens a confirmation with Cancel selected.
 
+## Device settings
+
+![Settings, About and Storage firmware renders](settings-preview.png)
+
+Press **CUST BTN 6** on the Browse home screen to open **Settings**. UP/DOWN
+selects **About** or **Storage**, and OK opens the selected page. BACK returns
+one page; HOME returns to browsing and keeps the highlighted remote. This
+shortcut applies only to home; CUST BTN 6 keeps its normal remote/key assignment
+behavior elsewhere.
+
+**About** shows the Universal Remote name, a monochrome remote logo, and the
+actual firmware version embedded by ESP-IDF (PROJECT_VER, or the build's Git
+version when no release version is configured). Long versions wrap across lines.
+
+**Storage** shows bytes occupied by saved remote profiles, learned commands,
+text, retained legacy IR recordings, and Bluetooth pairing/subscription data
+for saved profiles. Usage includes NVS allocation overhead. Free space is the
+shared NVS capacity available for more data, excluding reserved pages and other
+system allocations; it is not unused firmware flash. The existing 16-remote
+limit still applies independently of available bytes.
+
+Storage accounting runs only after the Storage page's first "Reading..." frame
+has been displayed. There is no startup scan or continuous polling. Reopening
+the page or pressing OK refreshes the snapshot; read failures show Storage
+unavailable and allow retry with OK. Opening the page only reads storage.
+
 ## Add a remote
 
 1. **Connect**: IR, BT or WIFI.

@@ -2,6 +2,7 @@
 #include "ui_icons.h"
 #include "u8g2.h"
 #include "esp_timer.h"
+#include "esp_app_desc.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -104,10 +105,8 @@ static void home_render(ui_ctx_t *ctx, u8g2_t *u8)
     }
     u8g2_SetDrawColor(u8, 1);
     if (ctx->home_sel < count) home_neighbor(u8, ctx->home_sel + 1, 93);
-    bool selected_ir = ctx->home_sel < count && app_remote_get(ctx->home_sel, &remote)
-        && remote.transport == REMOTE_IR;
     footer(ctx, u8, ctx->home_sel < count ? "OK:open" : "OK:add",
-           selected_ir ? "MODE:use" : ctx->home_sel < count ? "Select remote" : "HOME:browse");
+           "C6:settings");
 }
 static bool custom_key(unsigned key)
 {
@@ -143,6 +142,12 @@ static void enter_remote_mode(ui_ctx_t *ctx)
 }
 static void home_handle(ui_ctx_t *ctx, const ui_event_t *event)
 {
+    if (event->type == UI_EV_KEY && event->src == UI_SRC_KEYPAD
+        && event->value == REMOTE_KEY_CUSTOM6 && !event->repeat) {
+        ctx->settings_sel = 0;
+        ui_nav_push(ctx, UI_SCREEN_SETTINGS, NULL);
+        return;
+    }
     unsigned count = app_remote_count();
     if (event->type == UI_EV_UP && ctx->home_sel) --ctx->home_sel;
     if (event->type == UI_EV_DOWN && ctx->home_sel < count) ++ctx->home_sel;
@@ -176,6 +181,70 @@ static void home_handle(ui_ctx_t *ctx, const ui_event_t *event)
             }
         } else ui_nav_push(ctx, UI_SCREEN_EDIT, NULL);
     }
+}
+static void settings_handle(ui_ctx_t *ctx, const ui_event_t *event)
+{
+    if (event->type == UI_EV_UP && ctx->settings_sel) --ctx->settings_sel;
+    if (event->type == UI_EV_DOWN && ctx->settings_sel < 1) ++ctx->settings_sel;
+    if (event->type == UI_EV_BACK) ui_nav_pop(ctx);
+    if (event->type == UI_EV_OK && !event->repeat)
+        ui_nav_push(ctx, ctx->settings_sel ? UI_SCREEN_STORAGE : UI_SCREEN_ABOUT, NULL);
+}
+static void settings_render(ui_ctx_t *ctx, u8g2_t *u8)
+{
+    title(u8, "Settings", NULL);
+    row(u8, 32, "About", ctx->settings_sel == 0);
+    row(u8, 54, "Storage", ctx->settings_sel == 1);
+    footer(ctx, u8, "OK:open", "BACK:browse");
+}
+static void about_render(ui_ctx_t *ctx, u8g2_t *u8)
+{
+    title(u8, "About", NULL);
+    ui_draw_product_logo(u8, 16, 19);
+    u8g2_SetFont(u8, u8g2_font_6x10_tf);
+    center(u8, 63, "UNIVERSAL");
+    center(u8, 75, "REMOTE");
+    u8g2_SetFont(u8, u8g2_font_5x8_tf);
+    center(u8, 85, "Firmware");
+    // ESP-IDF embeds the actual project/build version in the running image.
+    // Wrap its full 31-character value instead of clipping long build IDs.
+    const char *version = esp_app_get_description()->version;
+    size_t length = strlen(version);
+    for (size_t offset = 0; offset < length; offset += 12) {
+        char line[13];
+        snprintf(line, sizeof(line), "%.12s", version + offset);
+        center(u8, 93 + (offset / 12) * 8, line);
+    }
+    footer(ctx, u8, "BACK:settings", "HOME:browse");
+}
+static void storage_handle(ui_ctx_t *ctx, const ui_event_t *event)
+{
+    if (event->type == UI_EV_BACK) ui_nav_pop(ctx);
+    if (event->type == UI_EV_OK && !event->repeat) ctx->storage_pending = true;
+}
+static void storage_render(ui_ctx_t *ctx, u8g2_t *u8)
+{
+    title(u8, "Storage", NULL);
+    u8g2_SetFont(u8, u8g2_font_6x10_tf);
+    if (ctx->storage_pending) {
+        center(u8, 56, "Reading...");
+    } else if (ctx->storage_status != ESP_OK) {
+        center(u8, 48, "Storage");
+        center(u8, 60, "unavailable");
+        u8g2_SetFont(u8, u8g2_font_5x8_tf);
+        center(u8, 83, "OK to retry");
+    } else {
+        char line[24];
+        center(u8, 31, "Remotes");
+        snprintf(line, sizeof(line), "%lu B used", (unsigned long)ctx->storage_usage.remote_bytes);
+        center(u8, 45, line);
+        center(u8, 67, "Free space");
+        snprintf(line, sizeof(line), "%lu B", (unsigned long)ctx->storage_usage.free_bytes);
+        center(u8, 81, line);
+        u8g2_SetFont(u8, u8g2_font_5x8_tf);
+        center(u8, 101, "Shared store");
+    }
+    footer(ctx, u8, "OK:refresh", "BACK:settings");
 }
 static bool save_mouse_speed(ui_ctx_t *ctx, remote_t *remote, unsigned speed)
 {
@@ -959,6 +1028,11 @@ static void screen_enter(ui_ctx_t *ctx, void *param)
 {
     (void)param;
     if (screen_id(ctx) == UI_SCREEN_SPLASH) ctx->splash_started = now_ms();
+    if (screen_id(ctx) == UI_SCREEN_STORAGE) {
+        ctx->storage_pending = true;
+        ctx->storage_status = ESP_OK;
+        memset(&ctx->storage_usage, 0, sizeof(ctx->storage_usage));
+    }
 }
 static void screen_exit(ui_ctx_t *ctx)
 {
@@ -974,6 +1048,13 @@ static void screen_exit(ui_ctx_t *ctx)
 static void screen_handle(ui_ctx_t *ctx, const ui_event_t *event)
 {
     if (event->type == UI_EV_TICK) {
+        // Let the initial Storage/Reading frame reach the OLED before scanning
+        // NVS. Cache this snapshot until the page is reopened or refreshed.
+        if (screen_id(ctx) == UI_SCREEN_STORAGE && ctx->storage_pending && !ctx->dirty) {
+            ctx->storage_status = app_storage_get_usage(&ctx->storage_usage);
+            ctx->storage_pending = false;
+            ctx->dirty = true;
+        }
         if (ctx->bt_session) {
             bt_snapshot_t snapshot = bt_keyboard_snapshot();
             if (snapshot.session == ctx->bt_session && (snapshot.state != ctx->bt_status.state
@@ -996,6 +1077,11 @@ static void screen_handle(ui_ctx_t *ctx, const ui_event_t *event)
     }
     switch (screen_id(ctx)) {
         case UI_SCREEN_HOME: home_handle(ctx, event); break;
+        case UI_SCREEN_SETTINGS: settings_handle(ctx, event); break;
+        case UI_SCREEN_ABOUT:
+            if (event->type == UI_EV_BACK) ui_nav_pop(ctx);
+            break;
+        case UI_SCREEN_STORAGE: storage_handle(ctx, event); break;
         case UI_SCREEN_REMOTE: remote_handle(ctx, event); break;
         case UI_SCREEN_EDIT: edit_handle(ctx, event); break;
         case UI_SCREEN_ADD_TYPE: type_handle(ctx, event); break;
@@ -1031,6 +1117,9 @@ static void screen_render(ui_ctx_t *ctx, u8g2_t *u8)
             center(u8, 74, "REMOTE");
             break;
         case UI_SCREEN_HOME: home_render(ctx, u8); break;
+        case UI_SCREEN_SETTINGS: settings_render(ctx, u8); break;
+        case UI_SCREEN_ABOUT: about_render(ctx, u8); break;
+        case UI_SCREEN_STORAGE: storage_render(ctx, u8); break;
         case UI_SCREEN_REMOTE: remote_render(ctx, u8); break;
         case UI_SCREEN_EDIT: edit_render(ctx, u8); break;
         case UI_SCREEN_ADD_TYPE: type_render(ctx, u8); break;

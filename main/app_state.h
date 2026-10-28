@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -102,6 +103,12 @@ void remote_bt_ensure_identity(remote_t *remote);
 unsigned remote_assigned_count(const remote_t *remote);
 bool app_remote_get(unsigned index, remote_t *remote);
 unsigned app_remote_count(void);
+typedef struct {
+    size_t remote_bytes;
+    size_t free_bytes;
+} app_storage_usage_t;
+// Read-only NVS accounting; call on demand from the Storage page, never at boot.
+esp_err_t app_storage_get_usage(app_storage_usage_t *usage);
 esp_err_t app_remote_create(const remote_t *remote, unsigned *index);
 esp_err_t app_remote_update(unsigned index, const remote_t *remote);
 esp_err_t app_remote_remove(unsigned index);
