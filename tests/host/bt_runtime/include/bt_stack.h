@@ -106,6 +106,7 @@ typedef void (*esp_event_handler_t)(void *, esp_event_base_t, int32_t, void *);
 enum { ESP_HIDD_START_EVENT, ESP_HIDD_CONTROL_EVENT, ESP_HIDD_ANY_EVENT = -1 };
 #define ESP_HID_TRANSPORT_BLE 1
 #define ESP_HID_APPEARANCE_KEYBOARD 0x03C1
+#define ESP_HID_APPEARANCE_MOUSE 0x03C2
 #define ESP_HID_PROTOCOL_MODE_REPORT 1
 typedef struct { struct { unsigned control; } control; } esp_hidd_event_data_t;
 typedef struct { const uint8_t *data; size_t len; } esp_hid_raw_report_map_t;

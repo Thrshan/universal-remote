@@ -1,4 +1,8 @@
-# Bluetooth keyboard remote
+# Bluetooth remotes
+
+Keyboard and mouse remotes share the connection menu, pairing, reconnection,
+Unpair and profile storage described here. See [mouse controls and patterns](bluetooth-mouse.md)
+for mouse setup, fixed mappings and saved movement speed.
 
 ![Actual OLED screen renders](bluetooth-preview.png)
 
@@ -6,8 +10,8 @@
 
 ## Create and use
 
-1. Choose **Add remote > BT > Keyboard**. Mouse and Controller display **On hold**
-   and cannot advance or create a remote.
+1. Choose **Add remote > BT > Keyboard** for the keyboard presets below, or
+   **Mouse** for Mouse mapped / Patterns. Controller displays **On hold**.
 2. Enter a name and select an icon, then choose **Fire TV**, **Media control**,
    **Text**, or **Custom**. Accepting the preset saves the remote and starts
    Bluetooth. Text and Custom open key assignment; MODE finishes assignment and
@@ -16,7 +20,7 @@
 3. The OLED shows **Starting BT**, then **BT searching** for a new profile. Open
    Bluetooth accessory pairing on the Fire TV and select **UR <remote name>**.
 4. **Connecting** means a link exists but encryption, profile storage, or keyboard
-   notification setup is still pending. **Connected** means keyboard reports can
+   notification setup is still pending. **Connected** means the selected HID reports can
    be sent. Verify the host's responses on the actual Fire TV.
 5. Press **MODE** to enter Remote mode. All mapped keys now control the host;
    BACK and HOME are appliance commands. MODE returns to the same BT menu with
@@ -87,7 +91,8 @@ report-mode and consumer descriptors and the battery descriptor; raw GATT
 handles are never stored. A small project-local `esp_hid` source replacement
 adds explicit snapshot APIs and zero-initializes the SDK's report state; see
 `components/esp_hid/README.md` and [Espressif issue 13054](https://github.com/espressif/esp-idf/issues/13054).
-The GATT database layout remains unchanged. Both Bluedroid and the controller
+The keyboard GATT database layout remains unchanged; a new mouse profile has a
+separate mouse report map. Both Bluedroid and the controller
 are deinitialized on exit so another profile starts with fresh link-layer state.
 Older firmware did not retain these subscriptions. If an existing Windows bond
 keeps flickering or stalls at Connecting after this upgrade, use Pair new and
@@ -169,6 +174,10 @@ store. Callback generations/session IDs reject stale events. Connected status
 requires successful encryption, durable peer storage, and a subscribed keyboard
 input report. The HID descriptor has an eight-byte keyboard report (ID 1) and
 a two-byte Consumer Control report (ID 2). There is no automatic volume demo.
+Mouse profiles use a separate five-byte report (ID 1): five buttons, relative
+X/Y, vertical wheel and horizontal AC Pan. The same worker schedules movement
+at a nominal 20 ms interval and stops it on exit, suspend, disconnect or send
+failure. No pattern resumes automatically after reconnecting.
 The controller is initialized once and enabled only during an open BT
 session. Bluedroid is disabled and deinitialized on exit, then initialized again
 on the next visit; keeping only a disabled host led to a privacy-list crash in
@@ -181,6 +190,25 @@ address resolution, accepting either its identity or resolvable private address.
 Fresh pairing and fixed-address peers leave resolution disabled. Each completion
 must arrive before advertising starts; a ten-second startup timeout or privacy
 failure reports BT error instead of opening the saved-host whitelist.
+
+The GATT callback records the actual link before queuing its worker message.
+Exiting, switching or choosing Pair new can invalidate an unprocessed CONNECT
+message; shutdown still disconnects that link and waits for the HID disconnect
+callback to finish before destroying services. If disconnection does not complete
+within 1.5 seconds, shutdown reports an error and leaves services intact for a
+retry. This avoids entering SDK teardown underneath a live connection. Startup
+and shutdown stages are logged and shown on the Bluetooth menu to distinguish a
+queued open from a stall inside the previous shutdown.
+
+The COM7 regression capture on 2026-10-28 reproduced a shutdown that never
+completed; opening other remotes then left their menus at Starting BT because
+the shared worker was still in the earlier shutdown. A new host regression
+test reproduces the missed queued CONNECT and fails before the link-tracking
+fix. After flashing the fix, COM7 recorded saved-mouse reconnection, fresh
+pairing, Pair new, and repeated switching between mouse and keyboard profiles
+with completed shutdowns. The user repeated the original sequence and confirmed
+it worked. Rapid switching also produced some host connection failures (0x08 /
+0x3E) while Reconnecting; these did not block subsequent shutdown/open requests.
 
 Unpair uses a separate stack-only path: it opens the selected bond store,
 removes the selected peer, waits for removal completion, and requests durable

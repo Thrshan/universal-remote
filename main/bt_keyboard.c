@@ -22,7 +22,7 @@
 #define PAIR_WINDOW_MS 120000
 
 typedef enum {
-    MSG_OPEN, MSG_CLOSE, MSG_FORGET, MSG_SAVED, MSG_TAP, MSG_RELEASE,
+    MSG_OPEN, MSG_CLOSE, MSG_FORGET, MSG_SAVED, MSG_TAP, MSG_RELEASE, MSG_MOUSE,
     MSG_HID_READY, MSG_ADV_DATA, MSG_SCAN_DATA, MSG_WHITELIST, MSG_ADDRESS, MSG_ADV_STARTED,
     MSG_PEER_PRIVACY, MSG_PRIVACY, MSG_CONNECTED, MSG_AUTH, MSG_DISCONNECTED, MSG_WRITE, MSG_SUSPEND,
 } message_type_t;
@@ -33,6 +33,8 @@ typedef struct {
     uint32_t session, generation, request;
     remote_t remote;
     unsigned key, profile_index;
+    bt_mouse_input_t mouse_input;
+    uint32_t time_ms;
     bool flag;
     esp_err_t error;
     uint8_t peer[6], addr_type;
@@ -47,6 +49,9 @@ static uint32_t s_desired_session, s_callback_generation;
 static uint32_t s_input_generation;
 static esp_err_t s_remove_result;
 static const char *s_operation = "Bluetooth";
+// Callback-level link state survives invalidation of queued worker messages.
+// In particular, CLOSE can overtake the worker's CONNECT message.
+static struct { bool up; uint8_t peer[6]; } s_link;
 
 // Only the worker owns the stack, reports, and connection state.
 static struct {
@@ -67,6 +72,8 @@ static struct {
     char name[24], store_name[16];
     esp_hidd_ccc_t persisted_ccc;
     bool ccc_persisted;
+    bt_mouse_t mouse;
+    uint32_t mouse_generation;
 } s;
 
 static uint32_t desired_session(void)
@@ -76,11 +83,28 @@ static uint32_t desired_session(void)
     portEXIT_CRITICAL(&s_lock);
     return result;
 }
+static bool physical_link(uint8_t *peer)
+{
+    portENTER_CRITICAL(&s_lock);
+    bool up = s_link.up;
+    if (up && peer) memcpy(peer, s_link.peer, 6);
+    portEXIT_CRITICAL(&s_lock);
+    return up;
+}
+static void lifecycle_step(const char *step)
+{
+    s_operation = step;
+    portENTER_CRITICAL(&s_lock);
+    if (s_snapshot.session == s.session) s_snapshot.step = step;
+    portEXIT_CRITICAL(&s_lock);
+    ESP_LOGI(TAG, "Session %u: %s", (unsigned)s.session, step);
+}
 static void status(bt_status_t state, esp_err_t error)
 {
     portENTER_CRITICAL(&s_lock);
     bool changed = s_snapshot.session != s.session || s_snapshot.state != state || s_snapshot.error != error;
-    s_snapshot = (bt_snapshot_t){.session = s.session, .state = state, .error = error, .step = s_operation};
+    s_snapshot = (bt_snapshot_t){.session = s.session, .state = state, .error = error, .step = s_operation,
+        .mouse_movement = s.mouse.movement, .mouse_buttons = s.mouse.buttons};
     portEXIT_CRITICAL(&s_lock);
     if (changed) ESP_LOGI(TAG, "Session %u: %s", (unsigned)s.session, bt_keyboard_status_name(state));
 }
@@ -144,6 +168,17 @@ static void gap_callback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *p
 static void gatts_callback(esp_gatts_cb_event_t event, esp_gatt_if_t interface,
                            esp_ble_gatts_cb_param_t *param)
 {
+    if (event == ESP_GATTS_CONNECT_EVT) {
+        xEventGroupClearBits(s_events, LINK_DOWN);
+        portENTER_CRITICAL(&s_lock);
+        s_link.up = true;
+        memcpy(s_link.peer, param->connect.remote_bda, 6);
+        portEXIT_CRITICAL(&s_lock);
+    } else if (event == ESP_GATTS_DISCONNECT_EVT) {
+        portENTER_CRITICAL(&s_lock);
+        s_link.up = false;
+        portEXIT_CRITICAL(&s_lock);
+    }
     // Let esp_hid process report subscriptions and release its send semaphore
     // before asking the worker to send anything.
     esp_hidd_gatts_event_handler(event, interface, param);
@@ -236,27 +271,40 @@ static bool bond_used_elsewhere(const esp_ble_bond_dev_t *bond)
             && bond_matches(bond, remote.bt.peer, remote.bt.addr_type)) return true;
     return false;
 }
-static void release_reports(void)
+static esp_err_t release_reports(void)
 {
-    if (!s.hid || !s.connected || !s.encrypted || !s.subscribed) return;
+    bt_mouse_reset(&s.mouse, s.session ^ (uint32_t)esp_timer_get_time());
+    portENTER_CRITICAL(&s_lock);
+    s.mouse_generation = s_input_generation;
+    s_snapshot.mouse_movement = s_snapshot.mouse_buttons = 0;
+    portEXIT_CRITICAL(&s_lock);
+    if (!s.hid || !s.connected || !s.encrypted || !s.subscribed || !physical_link(NULL)) return ESP_OK;
     uint8_t zero[8] = {0};
+    if (s.profile.bt.kind == BT_REMOTE_MOUSE) {
+        return esp_hidd_dev_input_set(s.hid, 0, BT_MOUSE_REPORT_ID, zero, BT_MOUSE_REPORT_SIZE);
+    }
     (void)esp_hidd_dev_input_set(s.hid, 0, 1, zero, 8);
     (void)esp_hidd_dev_input_set(s.hid, 0, 2, zero, 2);
+    return ESP_OK;
 }
 static esp_err_t disconnect_link(void)
 {
-    if (!s.connected) return ESP_OK;
     release_reports();
-    xEventGroupClearBits(s_events, LINK_DOWN);
-    esp_err_t err = esp_ble_gap_disconnect(s.peer);
-    if (err == ESP_OK && !(xEventGroupWaitBits(s_events, LINK_DOWN, pdTRUE, pdTRUE,
-                                               pdMS_TO_TICKS(1500)) & LINK_DOWN)) err = ESP_ERR_TIMEOUT;
+    uint8_t peer[6];
+    esp_err_t err = physical_link(peer) ? esp_ble_gap_disconnect(peer) : ESP_OK;
+    // CONNECT clears this bit; DISCONNECT sets it only after esp_hid has
+    // finished its callback. Keep it set until another actual connection.
+    bool down = (xEventGroupWaitBits(s_events, LINK_DOWN, pdFALSE, pdTRUE,
+                                    pdMS_TO_TICKS(1500)) & LINK_DOWN) != 0;
+    if (down) err = ESP_OK; // Also handles a peer disconnecting before our API call.
+    else if (err == ESP_OK) err = ESP_ERR_TIMEOUT;
     s.connected = s.encrypted = s.subscribed = false;
     return err;
 }
 static esp_err_t stop_advertising(void)
 {
     if (!s.advertising) return ESP_OK;
+    if (physical_link(NULL)) { s.advertising = false; return ESP_OK; }
     xEventGroupClearBits(s_events, ADV_STOPPED);
     esp_err_t err = esp_ble_gap_stop_advertising();
     if (err == ESP_OK && !(xEventGroupWaitBits(s_events, ADV_STOPPED, pdTRUE, pdTRUE,
@@ -272,31 +320,44 @@ static esp_err_t stop_runtime(void)
     portENTER_CRITICAL(&s_lock);
     s_callback_generation = 0;
     portEXIT_CRITICAL(&s_lock);
+    s.start_deadline = s.pair_deadline = s.connect_deadline = s.save_deadline = 0;
+    s.awaiting_save = s.forgetting = false;
+    if (s.host_on) lifecycle_step("Stop adverts");
     esp_err_t result = stop_advertising();
+    if (s.host_on) lifecycle_step("Disconnect");
     esp_err_t err = disconnect_link();
+    // Do not destroy the HID event loop or disable Bluedroid underneath a
+    // live/unfinished link. Return an actionable error instead of blocking
+    // inside SDK shutdown, which would stall every subsequent remote open.
+    if (err != ESP_OK) return err;
     if (result == ESP_OK) result = err;
     if (s.hid) {
+        lifecycle_step("HID stop");
         (void)esp_hidd_dev_event_handler_unregister(s.hid, hid_callback, ESP_HIDD_ANY_EVENT);
         err = esp_hidd_dev_deinit(s.hid);
         if (err == ESP_OK) s.hid = NULL;
         if (result == ESP_OK) result = err;
     }
     if (s.host_on) {
+        lifecycle_step("BT host off");
         err = esp_bluedroid_disable();
         if (err == ESP_OK) s.host_on = false;
         if (result == ESP_OK) result = err;
     }
     if (s.host_init && !s.host_on) {
+        lifecycle_step("BT host deinit");
         err = esp_bluedroid_deinit();
         if (err == ESP_OK) s.host_init = false;
         if (result == ESP_OK) result = err;
     }
     if (s.controller_on && !s.host_on) {
+        lifecycle_step("Controller off");
         err = esp_bt_controller_disable();
         if (err == ESP_OK) s.controller_on = false;
         if (result == ESP_OK) result = err;
     }
     if (s.controller_init && !s.controller_on && !s.host_init) {
+        lifecycle_step("Controller end");
         err = esp_bt_controller_deinit();
         if (err == ESP_OK) s.controller_init = false;
         if (result == ESP_OK) result = err;
@@ -306,14 +367,14 @@ static esp_err_t stop_runtime(void)
     s.hid_ready = s.adv_ready = s.scan_ready = s.whitelist_ready = false;
     s.address_ready = s.privacy_ready = s.peer_has_irk = false;
     s.privacy_phase = PRIVACY_RESETTING;
-    s.start_deadline = s.pair_deadline = s.connect_deadline = s.save_deadline = 0;
-    s.awaiting_save = s.forgetting = false;
     return result;
 }
 static void fail(esp_err_t error)
 {
+    const char *failed_step = s_operation;
     ESP_LOGE(TAG, "%s failed: %s (0x%x)", s_operation, esp_err_to_name(error), (unsigned)error);
     stop_runtime();
+    s_operation = failed_step;
     status(BT_ERROR, error);
 }
 static esp_err_t start_stack(void)
@@ -325,13 +386,14 @@ static esp_err_t start_stack(void)
     portENTER_CRITICAL(&s_lock);
     s_callback_generation = s.generation;
     portEXIT_CRITICAL(&s_lock);
-    s_operation = "Controller";
+    lifecycle_step("Controller init");
     esp_err_t err;
     if (!s.controller_init) {
         esp_bt_controller_config_t controller = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
         if ((err = esp_bt_controller_init(&controller)) != ESP_OK) return err;
         s.controller_init = true;
     }
+    lifecycle_step("Controller on");
     if ((err = esp_bt_controller_enable(ESP_BT_MODE_BLE)) != ESP_OK) return err;
     s.controller_on = true;
 
@@ -346,9 +408,10 @@ static esp_err_t start_stack(void)
     } else snprintf(s.store_name, sizeof(s.store_name), "ur_public");
     s_operation = "Bond storage";
     if ((err = esp_bt_config_file_path_update(s.store_name)) != ESP_OK) return err;
-    s_operation = "BT host";
+    lifecycle_step("BT host init");
     if ((err = esp_bluedroid_init()) != ESP_OK) return err;
     s.host_init = true;
+    lifecycle_step("BT host on");
     if ((err = esp_bluedroid_enable()) != ESP_OK) return err;
     s.host_on = true;
     s_operation = "Callbacks";
@@ -408,14 +471,16 @@ static esp_err_t start_runtime(void)
     s_operation = "Device name";
     if ((err = esp_ble_gap_set_device_name(s.name)) != ESP_OK) return err;
     s_operation = "Advertising";
-    if ((err = bt_configure_advertising(ESP_HID_APPEARANCE_KEYBOARD)) != ESP_OK) return err;
-    esp_hid_raw_report_map_t map = {.data = bt_keyboard_report_map, .len = bt_keyboard_report_map_size};
+    bool mouse = s.profile.bt.kind == BT_REMOTE_MOUSE;
+    if ((err = bt_configure_advertising(mouse ? ESP_HID_APPEARANCE_MOUSE : ESP_HID_APPEARANCE_KEYBOARD)) != ESP_OK) return err;
+    esp_hid_raw_report_map_t map = {.data = mouse ? bt_mouse_report_map : bt_keyboard_report_map,
+        .len = mouse ? bt_mouse_report_map_size : bt_keyboard_report_map_size};
     esp_hid_device_config_t config = {
-        .vendor_id = 0x303A, .product_id = 0x4001, .version = 0x0100,
+        .vendor_id = 0x303A, .product_id = mouse ? 0x4002 : 0x4001, .version = 0x0100,
         .device_name = s.name, .manufacturer_name = "Universal Remote",
         .serial_number = s.store_name, .report_maps = &map, .report_maps_len = 1,
     };
-    s_operation = "HID service";
+    lifecycle_step("HID service");
     return esp_hidd_dev_init(&config, ESP_HID_TRANSPORT_BLE, hid_callback, &s.hid);
 }
 static void advertise_if_ready(void)
@@ -477,7 +542,10 @@ static void ready_if_subscribed(void)
     if (s.subscribed) {
         s.connect_deadline = s.pair_deadline = 0;
         status(s.suspended ? BT_SUSPENDED : BT_CONNECTED, ESP_OK);
-    } else status(BT_CONNECTING, ESP_OK);
+    } else {
+        bt_mouse_reset(&s.mouse, s.session ^ (uint32_t)esp_timer_get_time());
+        status(BT_CONNECTING, ESP_OK);
+    }
 }
 static void post_peer(bool bonded, uint8_t type, const uint8_t *peer)
 {
@@ -511,7 +579,7 @@ static void tap(const message_t *msg)
     app_evt_t result = {.type = APP_EVT_BT_TX_FAIL, .request_id = msg->request};
     remote_t remote;
     output_context_t context = {.message = msg};
-    if (output_active(&context) && app_remote_get(s.profile_index, &remote)) {
+    if (s.profile.bt.kind == BT_REMOTE_KEYBOARD && output_active(&context) && app_remote_get(s.profile_index, &remote)) {
         bt_output_t output = {.context = &context, .active = output_active,
             .send = output_send, .pause = output_pause};
         // ESP-IDF advertises HID remote-wake support. An explicit user press
@@ -534,11 +602,40 @@ static void tap(const message_t *msg)
     }
     app_post_evt(&result);
 }
+static void mouse_output(const message_t *msg, bool tick)
+{
+    if (s.profile.bt.kind != BT_REMOTE_MOUSE) return;
+    output_context_t context = {.message = msg};
+    remote_t remote;
+    if (!output_active(&context) || (tick && s.suspended) || !app_remote_get(s.profile_index, &remote)) return;
+    bt_output_t output = {.context = &context, .active = output_active, .send = output_send, .pause = output_pause};
+    bool sent = tick ? bt_mouse_tick(&s.mouse, &remote, msg->time_ms, &output)
+        : bt_mouse_input(&s.mouse, &remote, msg->key, msg->mouse_input, msg->time_ms, &output);
+    portENTER_CRITICAL(&s_lock);
+    s_snapshot.mouse_movement = s.mouse.movement;
+    s_snapshot.mouse_buttons = s.mouse.buttons;
+    portEXIT_CRITICAL(&s_lock);
+    if (!sent && context.failed && desired_session() == s.session) {
+        // A failed button release must never leave a drag running on the host.
+        esp_err_t err = stop_runtime();
+        if (err == ESP_OK) err = start_runtime();
+        if (err != ESP_OK) fail(err);
+    }
+}
+static bool release_input(void)
+{
+    if (release_reports() == ESP_OK) return true;
+    // Even MODE cancellation must disconnect if the host missed button-up.
+    esp_err_t err = stop_runtime();
+    if (err == ESP_OK && desired_session() == s.session) err = start_runtime();
+    if (err != ESP_OK) fail(err);
+    return false;
+}
 static void worker(void *arg)
 {
     for (;;) {
         message_t msg;
-        if (xQueueReceive(s_queue, &msg, pdMS_TO_TICKS(25)) == pdTRUE) {
+        if (xQueueReceive(s_queue, &msg, pdMS_TO_TICKS(BT_MOUSE_INTERVAL_MS)) == pdTRUE) {
             if (msg.type == MSG_OPEN) {
                 if (msg.session != desired_session()) continue;
                 esp_err_t err = stop_runtime();
@@ -610,7 +707,8 @@ static void worker(void *arg)
                     } else ready_if_subscribed();
                 }
             } else if (msg.type == MSG_TAP && msg.session == s.session) tap(&msg);
-            else if (msg.type == MSG_RELEASE && msg.session == s.session) release_reports();
+            else if (msg.type == MSG_RELEASE && msg.session == s.session) release_input();
+            else if (msg.type == MSG_MOUSE && msg.session == s.session) mouse_output(&msg, false);
             else if (msg.generation && msg.generation == s.generation && s.host_on) {
                 if (desired_session() != s.session) continue;
                 switch (msg.type) {
@@ -722,6 +820,7 @@ static void worker(void *arg)
                         } else ready_if_subscribed();
                         break;
                     case MSG_DISCONNECTED:
+                        bt_mouse_reset(&s.mouse, s.session ^ (uint32_t)esp_timer_get_time());
                         if (s.connected) {
                             s.connected = s.encrypted = s.subscribed = s.suspended = false;
                             s.connect_deadline = 0;
@@ -735,7 +834,7 @@ static void worker(void *arg)
                         break;
                     case MSG_WRITE: ready_if_subscribed(); break;
                     case MSG_SUSPEND:
-                        if (msg.flag) release_reports();
+                        if (msg.flag && !release_input()) break;
                         s.suspended = msg.flag;
                         ready_if_subscribed();
                         break;
@@ -759,6 +858,14 @@ static void worker(void *arg)
             || (s.connect_deadline && now >= s.connect_deadline))) {
             stop_runtime(); status(BT_PAIR_TIMEOUT, ESP_ERR_TIMEOUT);
         }
+        // Generation cancellation also works when the release message could
+        // not fit in the queue. Stale mouse presses cannot restart a pattern.
+        portENTER_CRITICAL(&s_lock);
+        uint32_t input_generation = s_input_generation;
+        portEXIT_CRITICAL(&s_lock);
+        if (s.profile.bt.kind == BT_REMOTE_MOUSE && s.mouse_generation != input_generation) release_input();
+        message_t movement = {.session = s.session, .generation = input_generation, .time_ms = (uint32_t)(now / 1000)};
+        mouse_output(&movement, true);
     }
 }
 void bt_keyboard_init(void)
@@ -766,11 +873,12 @@ void bt_keyboard_init(void)
     s_queue = xQueueCreate(32, sizeof(message_t));
     s_events = xEventGroupCreate();
     ESP_ERROR_CHECK(s_queue && s_events ? ESP_OK : ESP_ERR_NO_MEM);
+    xEventGroupSetBits(s_events, LINK_DOWN);
     ESP_ERROR_CHECK(xTaskCreate(worker, "bt_keyboard", 6144, NULL, 5, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }
 bool bt_keyboard_open(const remote_t *remote, unsigned profile_index, uint32_t session)
 {
-    if (!remote || remote->transport != REMOTE_BT || remote->bt.kind != BT_REMOTE_KEYBOARD || !session) return false;
+    if (!remote || remote->transport != REMOTE_BT || remote->bt.kind > BT_REMOTE_MOUSE || !session) return false;
     message_t msg = {.type = MSG_OPEN, .session = session, .remote = *remote, .profile_index = profile_index};
     portENTER_CRITICAL(&s_lock);
     uint32_t previous = s_desired_session;
@@ -819,4 +927,18 @@ void bt_keyboard_release(uint32_t session)
     portEXIT_CRITICAL(&s_lock);
     message_t msg = {.type = MSG_RELEASE, .session = session};
     (void)enqueue(&msg);
+}
+bool bt_keyboard_mouse_input(uint32_t session, unsigned key, bt_mouse_input_t input, uint32_t time_ms)
+{
+    bt_snapshot_t snapshot = bt_keyboard_snapshot();
+    if (snapshot.session != session || desired_session() != session || !remote_key_assignable(key)
+        || (snapshot.state != BT_CONNECTED && snapshot.state != BT_SUSPENDED)) return false;
+    message_t msg = {.type = MSG_MOUSE, .session = session, .key = key, .mouse_input = input, .time_ms = time_ms};
+    portENTER_CRITICAL(&s_lock);
+    msg.generation = s_input_generation;
+    portEXIT_CRITICAL(&s_lock);
+    if (enqueue(&msg)) return true;
+    // Losing a release is unsafe; cancel all mouse input even with a full queue.
+    bt_keyboard_release(session);
+    return false;
 }

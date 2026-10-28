@@ -120,7 +120,7 @@ bool bt_binding_report(bt_binding_t binding, bt_key_report_t *report)
 bt_binding_t bt_profile_binding(const remote_t *remote, unsigned key)
 {
     bt_binding_t binding = {0};
-    if (!remote_key_assignable(key)) return binding;
+    if (remote->bt.kind != BT_REMOTE_KEYBOARD || !remote_key_assignable(key)) return binding;
     if (remote->bt.preset == BT_PRESET_CUSTOM) return remote->bt.bindings[key - 1];
     if (remote->bt.preset == BT_PRESET_TEXT) return binding;
     if (remote->bt.preset == BT_PRESET_FIRE_TV) {
@@ -154,6 +154,7 @@ bt_binding_t bt_profile_binding(const remote_t *remote, unsigned key)
 
 bool bt_profile_report(const remote_t *remote, unsigned key, bool long_hold, bt_key_report_t *report)
 {
+    if (remote->bt.kind != BT_REMOTE_KEYBOARD) return false;
     if (remote->bt.preset == BT_PRESET_FIRE_TV && long_hold)
         return bt_keymap_report(key, true, report);
     if (long_hold) return false;
@@ -162,7 +163,7 @@ bool bt_profile_report(const remote_t *remote, unsigned key, bool long_hold, bt_
 
 bool bt_profile_key_assigned(const remote_t *remote, unsigned key)
 {
-    if (!remote_key_assignable(key)) return false;
+    if (remote->bt.kind != BT_REMOTE_KEYBOARD || !remote_key_assignable(key)) return false;
     return remote->bt.preset == BT_PRESET_TEXT ? (remote->assigned & (1u << (key - 1))) != 0
         : bt_profile_binding(remote, key).keycode != 0;
 }

@@ -27,6 +27,7 @@ typedef enum {
     UI_EV_HOME_LONG,
     UI_EV_POWER_LONG,
     UI_EV_KEY_RELEASE,
+    UI_EV_KEY_LONG,
 
     // System
     UI_EV_TICK,        // periodic (cursor blink / animation)

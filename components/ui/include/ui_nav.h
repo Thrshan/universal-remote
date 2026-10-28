@@ -25,6 +25,7 @@ typedef struct ui_ctx {
     unsigned bt_menu_sel;
     unsigned bt_key_sel;
     unsigned bt_preset_sel;
+    unsigned bt_speed_draft;
     unsigned bt_binding_sel;
     uint8_t bt_modifiers;
     char bt_text_draft[BT_TEXT_MAX + 1];

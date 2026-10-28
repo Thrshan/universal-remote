@@ -42,7 +42,7 @@ static void hold_back(ui_ctx_t *ctx)
 }
 static void release(ui_ctx_t *ctx, unsigned number)
 {
-    ui_event_t event = {.type = UI_EV_KEY_RELEASE, .src = UI_SRC_KEYPAD, .value = number};
+    ui_event_t event = {.type = UI_EV_KEY_RELEASE, .src = UI_SRC_KEYPAD, .value = number, .ts_ms = host_time};
     ui_nav_dispatch(ctx, &event);
 }
 static void bt_peer(ui_ctx_t *ctx, bool bonded)
@@ -291,6 +291,107 @@ static int bluetooth_preset_checks(ui_ctx_t *ctx)
     CHECK(app_remote_update(0, &remote) == ESP_OK);
     app_state_init();
     CHECK(app_remote_get(0, &remote) && remote.bt.bond_store == BT_BOND_STORE_PROFILE && remote.bt.bonded);
+    return 0;
+}
+
+static int bluetooth_mouse_checks(ui_ctx_t *ctx)
+{
+    ui_nav_home(ctx);
+    unsigned count = app_remote_count(), opens = host_bt_opens;
+    ctx->home_sel = count;
+    key(ctx, 7); key(ctx, 9); key(ctx, 7); key(ctx, 9); key(ctx, 7);
+    CHECK(current(ctx) == UI_SCREEN_NAME && ctx->draft.bt.kind == BT_REMOTE_MOUSE && host_bt_opens == opens);
+    strcpy(ctx->draft.name, "Mouse"); ctx->keyboard_sel = 29; key(ctx, 7); key(ctx, 7);
+    CHECK(current(ctx) == UI_SCREEN_BT_PRESET && app_remote_count() == count);
+    snapshot(ctx, "32-bt-mouse-modes");
+    key(ctx, 10); CHECK(current(ctx) == UI_SCREEN_ICON);
+    key(ctx, 7); key(ctx, 7);
+    CHECK(current(ctx) == UI_SCREEN_BT_DEVICE && app_remote_count() == count + 1 && host_bt_opens == opens + 1);
+    unsigned mapped = ctx->active_remote;
+    remote_t remote;
+    CHECK(app_remote_get(mapped, &remote) && remote.bt.mouse_mode == BT_MOUSE_MAPPED && bt_mouse_speed(&remote) == 5);
+    CHECK(remote_assigned_count(&remote) == 15);
+    CHECK(app_remote_set_bt_binding(mapped, REMOTE_KEY_UP, (bt_binding_t){4,0}) == ESP_ERR_INVALID_ARG);
+    CHECK(app_remote_set_bt_text(mapped, REMOTE_KEY_UP, "hello") == ESP_ERR_INVALID_ARG);
+    ctx->bt_menu_sel = 3; key(ctx, 7); ctx->bt_key_sel = REMOTE_KEY_OK;
+    snapshot(ctx, "33-bt-mouse-keymap"); key(ctx, 10);
+    host_bt_status.state = BT_CONNECTED;
+    key(ctx, 2);
+    host_bt_report_count = 0;
+    key(ctx, 7); release(ctx, 7); key(ctx, 7); release(ctx, 7);
+    CHECK(host_bt_report_count == 4 && host_bt_reports[0].data[0] == 1 && host_bt_reports[3].data[0] == 0);
+    key(ctx, 7);
+    ui_event_t held = {.type = UI_EV_OK_LONG, .src = UI_SRC_KEYPAD, .value = REMOTE_KEY_OK, .ts_ms = host_time + 700};
+    ui_nav_dispatch(ctx, &held); release(ctx, 7);
+    CHECK(host_bt_status.mouse_buttons == 1);
+    key(ctx, 8); CHECK(host_bt_status.mouse_movement == REMOTE_KEY_RIGHT);
+    release(ctx, 8); CHECK(!host_bt_status.mouse_movement && host_bt_status.mouse_buttons == 1);
+    tick(ctx, host_time + 1000); snapshot(ctx, "34-bt-mouse-drag");
+    unsigned mouse_reports = host_bt_report_count;
+    key(ctx, REMOTE_KEY_CUSTOM4); release(ctx, REMOTE_KEY_CUSTOM4);
+    CHECK(app_remote_get(mapped, &remote) && bt_mouse_speed(&remote) == 6 && host_bt_status.mouse_buttons == 1);
+    held.type = UI_EV_KEY_LONG; held.value = REMOTE_KEY_CUSTOM4;
+    ui_nav_dispatch(ctx, &held);
+    CHECK(app_remote_get(mapped, &remote) && bt_mouse_speed(&remote) == 6);
+    key(ctx, REMOTE_KEY_CUSTOM5); release(ctx, REMOTE_KEY_CUSTOM5);
+    CHECK(app_remote_get(mapped, &remote) && bt_mouse_speed(&remote) == 5 && host_bt_status.mouse_buttons == 1);
+    CHECK(host_bt_report_count == mouse_reports); // Speed keys never send host clicks or wheel events.
+    host_fail_save = 1; key(ctx, REMOTE_KEY_CUSTOM4); release(ctx, REMOTE_KEY_CUSTOM4); host_fail_save = 0;
+    CHECK(app_remote_get(mapped, &remote) && bt_mouse_speed(&remote) == 5);
+    for (unsigned i = 0; i < 12; ++i) { key(ctx, REMOTE_KEY_CUSTOM4); release(ctx, REMOTE_KEY_CUSTOM4); }
+    CHECK(app_remote_get(mapped, &remote) && bt_mouse_speed(&remote) == BT_MOUSE_SPEED_MAX);
+    for (unsigned i = 0; i < 12; ++i) { key(ctx, REMOTE_KEY_CUSTOM5); release(ctx, REMOTE_KEY_CUSTOM5); }
+    CHECK(app_remote_get(mapped, &remote) && bt_mouse_speed(&remote) == 1);
+    for (unsigned i = 0; i < 4; ++i) { key(ctx, REMOTE_KEY_CUSTOM4); release(ctx, REMOTE_KEY_CUSTOM4); }
+    key(ctx, 7); release(ctx, 7); CHECK(!host_bt_status.mouse_buttons);
+    key(ctx, 2); CHECK(current(ctx) == UI_SCREEN_BT_DEVICE && !host_bt_status.mouse_movement);
+    ctx->bt_menu_sel = 4; key(ctx, 7); CHECK(current(ctx) == UI_SCREEN_BT_SPEED && ctx->bt_speed_draft == 5);
+    key(ctx, 5); host_fail_save = 1; key(ctx, 7);
+    CHECK(current(ctx) == UI_SCREEN_BT_SPEED && app_remote_get(mapped, &remote) && bt_mouse_speed(&remote) == 5);
+    host_fail_save = 0; key(ctx, 7); CHECK(current(ctx) == UI_SCREEN_BT_DEVICE);
+    CHECK(app_remote_get(mapped, &remote) && bt_mouse_speed(&remote) == 6);
+    key(ctx, REMOTE_KEY_MODE); key(ctx, REMOTE_KEY_CUSTOM4); release(ctx, REMOTE_KEY_CUSTOM4);
+    key(ctx, REMOTE_KEY_MODE); key(ctx, REMOTE_KEY_OK);
+    CHECK(current(ctx) == UI_SCREEN_BT_SPEED && ctx->bt_speed_draft == 7); // Remote shortcut and menu share one saved value.
+    key(ctx, REMOTE_KEY_DOWN); key(ctx, REMOTE_KEY_OK);
+    key(ctx, 7); key(ctx, 5); key(ctx, 10);
+    CHECK(app_remote_get(mapped, &remote) && bt_mouse_speed(&remote) == 6); // Cancel keeps saved speed.
+    ctx->bt_menu_sel = 5; key(ctx, 7); CHECK(current(ctx) == UI_SCREEN_EDIT);
+    key(ctx, 12); CHECK(current(ctx) == UI_SCREEN_HOME && !ctx->bt_session);
+
+    ctx->home_sel = app_remote_count();
+    key(ctx, 7); key(ctx, 9); key(ctx, 7); key(ctx, 9); key(ctx, 7);
+    strcpy(ctx->draft.name, "Patterns"); ctx->keyboard_sel = 29;
+    key(ctx, 7); key(ctx, 7); key(ctx, 9); key(ctx, 7);
+    unsigned patterns = ctx->active_remote;
+    CHECK(current(ctx) == UI_SCREEN_BT_DEVICE && app_remote_get(patterns, &remote) && remote.bt.mouse_mode == BT_MOUSE_PATTERNS);
+    CHECK(remote_assigned_count(&remote) == 8);
+    host_bt_status.state = BT_CONNECTED;
+    key(ctx, 2); key(ctx, 8); release(ctx, 8);
+    CHECK(host_bt_status.mouse_movement == REMOTE_KEY_RIGHT);
+    key(ctx, 13); CHECK(app_remote_get(patterns, &remote) && bt_mouse_speed(&remote) == 6);
+    host_fail_save = 1; key(ctx, 13); host_fail_save = 0;
+    CHECK(app_remote_get(patterns, &remote) && bt_mouse_speed(&remote) == 6);
+    ui_event_t repeat = {.type = UI_EV_KEY, .src = UI_SRC_KEYPAD, .value = REMOTE_KEY_VOL_UP, .repeat = true};
+    for (unsigned i = 0; i < 12; ++i) ui_nav_dispatch(ctx, &repeat);
+    CHECK(app_remote_get(patterns, &remote) && bt_mouse_speed(&remote) == 10);
+    key(ctx, 7); release(ctx, 7); CHECK(host_bt_status.mouse_buttons == 1);
+    key(ctx, 19); release(ctx, 19); CHECK(host_bt_status.mouse_movement == REMOTE_KEY_CUSTOM4);
+    key(ctx, 19);
+    held.type = UI_EV_KEY_LONG; held.value = REMOTE_KEY_CUSTOM4;
+    ui_nav_dispatch(ctx, &held); release(ctx, 19); CHECK(!host_bt_status.mouse_movement);
+    key(ctx, 19); release(ctx, 19); tick(ctx, host_time + 50);
+    ctx->notice[0] = 0;
+    snapshot(ctx, "35-bt-mouse-pattern");
+    key(ctx, 2); CHECK(!host_bt_status.mouse_buttons && !host_bt_status.mouse_movement);
+    ctx->bt_menu_sel = 4; key(ctx, 7); snapshot(ctx, "36-bt-mouse-speed"); key(ctx, 10);
+    key(ctx, 10); CHECK(!ctx->bt_session);
+    app_state_init();
+    CHECK(app_remote_get(mapped, &remote) && remote.bt.kind == BT_REMOTE_MOUSE && bt_mouse_speed(&remote) == 6);
+    CHECK(app_remote_get(patterns, &remote) && remote.bt.mouse_mode == BT_MOUSE_PATTERNS && bt_mouse_speed(&remote) == 10);
+    ctx->home_sel = patterns; key(ctx, 7);
+    CHECK(current(ctx) == UI_SCREEN_BT_DEVICE);
+    key(ctx, 10);
     return 0;
 }
 
@@ -584,7 +685,8 @@ int main(void)
             CHECK(current(&ctx) == UI_SCREEN_BT_TYPE);
             snapshot(&ctx, "19-bt-type");
             key(&ctx, 9); key(&ctx, 7);
-            CHECK(current(&ctx) == UI_SCREEN_BT_TYPE && app_remote_count() == 1);
+            CHECK(current(&ctx) == UI_SCREEN_NAME && ctx.draft.bt.kind == BT_REMOTE_MOUSE && app_remote_count() == 1);
+            key(&ctx, 10);
             key(&ctx, 9); key(&ctx, 7);
             CHECK(current(&ctx) == UI_SCREEN_BT_TYPE && app_remote_count() == 1);
             key(&ctx, 5); key(&ctx, 5); key(&ctx, 7);
@@ -754,6 +856,7 @@ int main(void)
     key(&ctx, REMOTE_KEY_HOME);
     CHECK(app_remote_count() == 3);
     CHECK(bluetooth_preset_checks(&ctx) == 0);
+    CHECK(bluetooth_mouse_checks(&ctx) == 0);
     printf("PASS: %u behavior checks; portrait screen snapshots saved in build_host.\n", checks);
     return 0;
 }

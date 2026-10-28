@@ -7,6 +7,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "bt_keymap.h"
+#include "bt_mouse.h"
 #include "esp_random.h"
 
 static app_ctx_t s_app;
@@ -67,7 +68,8 @@ void remote_bt_ensure_identity(remote_t *remote)
 unsigned remote_assigned_count(const remote_t *remote)
 {
     unsigned count = 0;
-    uint32_t assigned = remote->transport == REMOTE_BT && remote->bt.kind == BT_REMOTE_KEYBOARD
+    uint32_t assigned = remote->transport == REMOTE_BT && remote->bt.kind == BT_REMOTE_MOUSE
+        ? bt_mouse_mask(remote->bt.mouse_mode) : remote->transport == REMOTE_BT && remote->bt.kind == BT_REMOTE_KEYBOARD
         ? bt_profile_mask(remote) : remote->assigned;
     for (unsigned key = 1; key <= REMOTE_KEY_COUNT; ++key)
         if (remote_key_assignable(key) && (assigned & (1u << (key - 1)))) ++count;
@@ -109,7 +111,9 @@ static bool valid_remote(const remote_t *remote)
     const uint32_t allowed = ((1u << REMOTE_KEY_COUNT) - 1u) & ~(1u << (REMOTE_KEY_MODE - 1));
     if (remote->transport == REMOTE_BT) {
         if (remote->bt.preset > BT_PRESET_CUSTOM || remote->bt.bond_store > BT_BOND_STORE_PROFILE) return false;
-        if (remote->bt.preset == BT_PRESET_CUSTOM)
+        if (remote->bt.kind == BT_REMOTE_MOUSE
+            && (remote->bt.mouse_mode > BT_MOUSE_PATTERNS || remote->bt.mouse_speed > BT_MOUSE_SPEED_MAX)) return false;
+        if (remote->bt.kind == BT_REMOTE_KEYBOARD && remote->bt.preset == BT_PRESET_CUSTOM)
             for (unsigned i = 0; i < REMOTE_KEY_COUNT; ++i)
                 if (!bt_binding_valid(remote->bt.bindings[i])
                     || (i == REMOTE_KEY_MODE - 1 && remote->bt.bindings[i].keycode)) return false;
@@ -237,7 +241,7 @@ esp_err_t app_remote_set_bt_binding(unsigned index, unsigned key, bt_binding_t b
 {
     remote_t remote;
     if (!remote_key_assignable(key) || !bt_binding_valid(binding) || !app_remote_get(index, &remote)
-        || remote.transport != REMOTE_BT || remote.bt.preset != BT_PRESET_CUSTOM) return ESP_ERR_INVALID_ARG;
+        || remote.transport != REMOTE_BT || remote.bt.kind != BT_REMOTE_KEYBOARD || remote.bt.preset != BT_PRESET_CUSTOM) return ESP_ERR_INVALID_ARG;
     remote.bt.bindings[key - 1] = binding;
     remote.assigned = bt_profile_mask(&remote);
     return app_remote_update(index, &remote);
@@ -247,7 +251,7 @@ bool app_remote_get_bt_text(unsigned index, unsigned key, char text[BT_TEXT_MAX 
     if (!remote_key_assignable(key)) return false;
     xSemaphoreTake(s_app.model_mutex, portMAX_DELAY);
     bool valid = index < s_app.remote_count && s_app.remotes[index].transport == REMOTE_BT
-        && s_app.remotes[index].bt.preset == BT_PRESET_TEXT;
+        && s_app.remotes[index].bt.kind == BT_REMOTE_KEYBOARD && s_app.remotes[index].bt.preset == BT_PRESET_TEXT;
     if (valid) memcpy(text, s_app.bt_text[index][key - 1], BT_TEXT_MAX + 1);
     xSemaphoreGive(s_app.model_mutex);
     return valid;
@@ -256,7 +260,7 @@ esp_err_t app_remote_set_bt_text(unsigned index, unsigned key, const char *text)
 {
     remote_t remote;
     if (!remote_key_assignable(key) || !bt_text_valid(text) || !app_remote_get(index, &remote)
-        || remote.transport != REMOTE_BT || remote.bt.preset != BT_PRESET_TEXT) return ESP_ERR_INVALID_ARG;
+        || remote.transport != REMOTE_BT || remote.bt.kind != BT_REMOTE_KEYBOARD || remote.bt.preset != BT_PRESET_TEXT) return ESP_ERR_INVALID_ARG;
     char previous[BT_TEXT_MAX + 1];
     xSemaphoreTake(s_app.model_mutex, portMAX_DELAY);
     memcpy(previous, s_app.bt_text[index][key - 1], sizeof(previous));
